@@ -28,6 +28,7 @@ solo/
   README.md                   本文件（车道说明 + 升级流程）
   patches/0001-rerank-in-hybrid-search.patch   【默认启用】能力补丁：hybrid-search 支持 enable_rerank
   patches/0002-data-analysis-endpoints.patch  【默认启用】能力补丁：问数执行 + 表格元信息端点（无 agent）
+  patches/0003-duckdb-bounded-extension-install.patch  【默认启用】健壮性补丁：DuckDB 扩展安装有界化（离线不再卡启动）
   patches-optional/0001-strip-stage1.patch     【--with-strip 才启用】体积补丁（DuckDB/数据分析/表格摘要）
   scripts/build-windows.sh    Windows/amd64 构建（应用补丁 → 生成 sqlite3.h → 编译）
 .github/workflows/solo-lite-windows.yml   CI：windows-latest 出活 + SHA256
@@ -54,6 +55,7 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 - `patches/`（默认启用）：**能力补丁**——附加式、每项对应一个上游 PR/Issue，上游合并后即删。当前：
   - `0001-rerank-in-hybrid-search.patch`：`SearchParams.enable_rerank` + `HybridSearch` 在融合后调用 tenant 配置的 rerank 模型（含单测 5 例；失败回退融合顺序）。
   - `0002-data-analysis-endpoints.patch`：`POST /knowledge/:id/data-analysis`（只读 SQL 执行）与 `GET /knowledge/:id/data-schema`（表元信息），复用内置 Agent 的 `data_analysis`/`data_schema` 工具实现；含 handler 单测 4 例 + 路由能力断言更新。
+  - `0003-duckdb-bounded-extension-install.patch`：`NewDuckDB()` 的扩展准备改为**离线优先 + 探活门控**（先 `LOAD`，已装/预置零网络；缺失时先 3s HTTPS 探活 `extensions.duckdb.org`，探不通直接跳过安装；探通才 `INSTALL`，`autoinstall` 关掉以免 LOAD 隐式联网；总预算默认 60s，`DUCKDB_EXTENSION_TIMEOUT_SECONDS` 可调，探活被墙可用 `DUCKDB_FORCE_EXTENSION_INSTALL=1` 绕过）。原因：无外网环境原会**卡死启动**（不报错、不监听端口），实测 **ctx 超时管不住 DuckDB 自己的下载重试**（黑洞网络下 INSTALL 独自烧 ~81s；且 TCP 探活会被「接受连接后黑洞」的代理骗过，必须用 HTTPS）——把「能不能启动」交给部署者设 `DUCKDB_SKIP_EXTENSION_LOAD` 不可靠（2026-09-12 拍板）。实测：WSL 无 egress、不设任何开关 → DuckDB 初始化到 `Server is running` **3.3s** + `/health` 200。上游 PR 意图：启动路径不得依赖外部网络可达性。
 - `patches-optional/`（`--with-strip` 才启用）：**体积补丁**——删除 Lite 不可达能力（DuckDB 数据分析工具/表格摘要任务/悬空 `data_schema`）。仅当体积/内存成为发布阻塞时用；与能力无关（剥离后问数、rerank 走引擎新端点，不受影响）。
 
 ## 升级流程（上游出新 tag 时）
