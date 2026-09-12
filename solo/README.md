@@ -25,6 +25,7 @@
 solo/
   README.md                   本文件（车道说明 + 升级流程）
   patches/0001-rerank-in-hybrid-search.patch   【默认启用】能力补丁：hybrid-search 支持 enable_rerank
+  patches/0002-data-analysis-endpoints.patch  【默认启用】能力补丁：问数执行 + 表格元信息端点（无 agent）
   patches-optional/0001-strip-stage1.patch     【--with-strip 才启用】体积补丁（DuckDB/数据分析/表格摘要）
   scripts/build-windows.sh    Windows/amd64 构建（应用补丁 → 生成 sqlite3.h → 编译）
 .github/workflows/solo-lite-windows.yml   CI：windows-latest 出活 + SHA256
@@ -50,6 +51,7 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 
 - `patches/`（默认启用）：**能力补丁**——附加式、每项对应一个上游 PR/Issue，上游合并后即删。当前：
   - `0001-rerank-in-hybrid-search.patch`：`SearchParams.enable_rerank` + `HybridSearch` 在融合后调用 tenant 配置的 rerank 模型（含单测 5 例；失败回退融合顺序）。
+  - `0002-data-analysis-endpoints.patch`：`POST /knowledge/:id/data-analysis`（只读 SQL 执行）与 `GET /knowledge/:id/data-schema`（表元信息），复用内置 Agent 的 `data_analysis`/`data_schema` 工具实现；含 handler 单测 4 例 + 路由能力断言更新。
 - `patches-optional/`（`--with-strip` 才启用）：**体积补丁**——删除 Lite 不可达能力（DuckDB 数据分析工具/表格摘要任务/悬空 `data_schema`）。仅当体积/内存成为发布阻塞时用；与能力无关（剥离后问数、rerank 走引擎新端点，不受影响）。
 
 ## 升级流程（上游出新 tag 时）
@@ -69,7 +71,7 @@ bash solo/scripts/build-windows.sh          # 自动应用 patches/；冲突则�
 
 目标形态：**宿主 Agent（唯一编排） + 引擎（无 agent 的纯能力面）**。
 
-- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排，本车道补丁）。
-- 待补（引擎侧，附加式）：**问数执行端点**（把内置 Agent 的 `data_analysis`/`data_schema` 工具暴露为独立 HTTP 能力；宿主只做「问题→SQL」的规划，DuckDB 执行与表格解析留在引擎）；可选通用化：`POST /engine-tools/{tool}` 一次暴露 KB 工具子集。
-- 宿主侧：`KbEnginePort` 收口端点；工具注册走已有 `agent.mastra.tool` 机制；MCP 作为后续可选薄壳。
+- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排）；**问数端点** `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema`（E2/E3，DuckDB 执行与表格解析均在引擎）。
+- 宿主侧：`KbEnginePort` 收口端点；工具注册走已有 `agent.mastra.tool` 机制（`kb_search` / `kb_data_schema` / `kb_data_query`）；MCP 作为后续可选薄壳。宿主 Agent 只做“问题→只读 SQL”的规划与结果解释。
+- 待定：`POST /engine-tools/{tool}` 通用工具端点（E5，仅在出现第二消费方时推进）。
 - 许可清单随包（`scripts/copy-licenses.sh`）与发布物装配（Solo 侧 W5）。

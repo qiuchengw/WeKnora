@@ -1,0 +1,470 @@
+diff --git a/internal/application/service/knowledge_data_query.go b/internal/application/service/knowledge_data_query.go
+new file mode 100644
+index 0000000..876f76f
+--- /dev/null
++++ b/internal/application/service/knowledge_data_query.go
+@@ -0,0 +1,117 @@
++package service
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++
++	"github.com/Tencent/WeKnora/internal/agent/tools"
++	"github.com/Tencent/WeKnora/internal/logger"
++	"github.com/Tencent/WeKnora/internal/types"
++	"github.com/Tencent/WeKnora/internal/types/interfaces"
++)
++
++// knowledgeDataQueryService implements the agent-less tabular-data capability
++// endpoints (ADR-0019 D-18 E2/E3). It deliberately reuses the built-in agent's
++// tools instead of reimplementing DuckDB access, so there is a single execution
++// path for data questions whether they arrive through the agent or an HTTP
++// capability call.
++type knowledgeDataQueryService struct {
++	knowledgeBaseService interfaces.KnowledgeBaseService
++	knowledgeService     interfaces.KnowledgeService
++	tenantService        interfaces.TenantService
++	fileService          interfaces.FileService
++	chunkService         interfaces.ChunkService
++	duckdb               *sql.DB
++	storageResolver      interfaces.StorageBackendResolver
++}
++
++// NewKnowledgeDataQueryService wires the tabular-data capability service.
++func NewKnowledgeDataQueryService(
++	knowledgeBaseService interfaces.KnowledgeBaseService,
++	knowledgeService interfaces.KnowledgeService,
++	tenantService interfaces.TenantService,
++	fileService interfaces.FileService,
++	chunkService interfaces.ChunkService,
++	duckdb *sql.DB,
++	storageResolver interfaces.StorageBackendResolver,
++) interfaces.KnowledgeDataQueryService {
++	return &knowledgeDataQueryService{
++		knowledgeBaseService: knowledgeBaseService,
++		knowledgeService:     knowledgeService,
++		tenantService:        tenantService,
++		fileService:          fileService,
++		chunkService:         chunkService,
++		duckdb:               duckdb,
++		storageResolver:      storageResolver,
++	}
++}
++
++// searchTargetsForKnowledge builds the same request scope the agent path would
++// pass to these tools: exactly one KB and one document. The tools then authorize
++// against that scope, so an id from another tenant cannot be reached even if the
++// handler-level RBAC guard were ever bypassed.
++func searchTargetsForKnowledge(knowledge *types.Knowledge) types.SearchTargets {
++	return types.SearchTargets{{
++		Type:            types.SearchTargetTypeKnowledge,
++		TenantID:        knowledge.TenantID,
++		KnowledgeBaseID: knowledge.KnowledgeBaseID,
++		KnowledgeIDs:    []string{knowledge.ID},
++	}}
++}
++
++func (s *knowledgeDataQueryService) newDataAnalysisTool(knowledge *types.Knowledge) *tools.DataAnalysisTool {
++	// One DuckDB session per request keeps concurrently analyzed documents from
++	// sharing a namespace; Cleanup drops the tables the request created.
++	sessionID := fmt.Sprintf("data_query_%s", knowledge.ID)
++	return tools.NewDataAnalysisTool(
++		s.knowledgeBaseService,
++		s.knowledgeService,
++		s.tenantService,
++		s.fileService,
++		s.duckdb,
++		sessionID,
++		s.storageResolver,
++	).WithSearchTargets(searchTargetsForKnowledge(knowledge))
++}
++
++// DataSchema returns the table metadata recorded for one document.
++func (s *knowledgeDataQueryService) DataSchema(ctx context.Context, knowledgeID string) (*types.ToolResult, error) {
++	knowledge, err := s.knowledgeService.GetKnowledgeByID(ctx, knowledgeID)
++	if err != nil {
++		return nil, err
++	}
++	tool := tools.NewDataSchemaTool(s.knowledgeService, s.chunkService.GetRepository()).
++		WithSearchTargets(searchTargetsForKnowledge(knowledge))
++	args, err := json.Marshal(tools.DataSchemaInput{KnowledgeID: knowledgeID})
++	if err != nil {
++		return nil, err
++	}
++	return tool.Execute(ctx, args)
++}
++
++// DataAnalysis loads one document into DuckDB and executes a read-only statement
++// against it. Statement validation (SELECT/SHOW/DESCRIBE/EXPLAIN/PRAGMA only)
++// stays inside the shared tool, so the capability endpoint cannot drift from the
++// agent path.
++func (s *knowledgeDataQueryService) DataAnalysis(ctx context.Context, knowledgeID string, sqlText string) (*types.ToolResult, error) {
++	knowledge, err := s.knowledgeService.GetKnowledgeByID(ctx, knowledgeID)
++	if err != nil {
++		return nil, err
++	}
++	tool := s.newDataAnalysisTool(knowledge)
++	defer tool.Cleanup(ctx)
++
++	if _, err := tool.LoadFromKnowledge(ctx, knowledge); err != nil {
++		// A non-tabular or unreadable document is a caller-visible condition, not
++		// an internal failure; the handler maps it to 400.
++		return nil, fmt.Errorf("document %s cannot be loaded for analysis: %w", knowledgeID, err)
++	}
++	args, err := json.Marshal(tools.DataAnalysisInput{KnowledgeID: knowledgeID, Sql: sqlText})
++	if err != nil {
++		return nil, err
++	}
++	logger.Infof(ctx, "Tabular data analysis via capability endpoint, knowledge: %s", knowledgeID)
++	return tool.Execute(ctx, args)
++}
+diff --git a/internal/container/container.go b/internal/container/container.go
+index 19230a1..976e07a 100644
+--- a/internal/container/container.go
++++ b/internal/container/container.go
+@@ -211,6 +211,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
+ 	must(container.Provide(service.NewKnowledgeService))
+ 	must(container.Provide(service.NewSpanTracker))
+ 	must(container.Provide(service.NewChunkService))
++	must(container.Provide(service.NewKnowledgeDataQueryService))
+ 	must(container.Provide(service.NewKnowledgeTagService))
+ 	must(container.Provide(embedding.NewBatchEmbedder))
+ 	must(container.Provide(service.NewModelService))
+@@ -397,6 +398,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
+ 	must(container.Provide(handler.NewAuditLogHandler))
+ 	must(container.Provide(handler.NewKnowledgeBaseHandler))
+ 	must(container.Provide(handler.NewKnowledgeHandler))
++	must(container.Provide(handler.NewKnowledgeDataQueryHandler))
+ 	must(container.Provide(handler.NewChunkHandler))
+ 	must(container.Provide(handler.NewFAQHandler))
+ 	must(container.Provide(handler.NewTagHandler))
+diff --git a/internal/handler/knowledge_data_query.go b/internal/handler/knowledge_data_query.go
+new file mode 100644
+index 0000000..31bc9fb
+--- /dev/null
++++ b/internal/handler/knowledge_data_query.go
+@@ -0,0 +1,62 @@
++package handler
++
++import (
++	"net/http"
++
++	"github.com/gin-gonic/gin"
++
++	apperrors "github.com/Tencent/WeKnora/internal/errors"
++	"github.com/Tencent/WeKnora/internal/logger"
++	"github.com/Tencent/WeKnora/internal/types/interfaces"
++)
++
++// KnowledgeDataQueryHandler serves the agent-less tabular-data capability
++// endpoints (ADR-0019 D-18 E2/E3):
++//
++//	POST /knowledge/:id/data-schema    — table metadata recorded at ingestion
++//	POST /knowledge/:id/data-analysis  — read-only SQL over the document's data
++//
++// Authorization reuses the knowledge RBAC chain (viewer + KB read), so the
++// endpoints grant nothing the caller could not already read.
++type KnowledgeDataQueryHandler struct {
++	service interfaces.KnowledgeDataQueryService
++}
++
++// NewKnowledgeDataQueryHandler wires the capability handler.
++func NewKnowledgeDataQueryHandler(service interfaces.KnowledgeDataQueryService) *KnowledgeDataQueryHandler {
++	return &KnowledgeDataQueryHandler{service: service}
++}
++
++type dataAnalysisRequest struct {
++	SQL string `json:"sql" binding:"required"`
++}
++
++// DataSchema returns the table shape of one document so a caller can plan SQL.
++func (h *KnowledgeDataQueryHandler) DataSchema(c *gin.Context) {
++	knowledgeID := c.Param("id")
++	result, err := h.service.DataSchema(c.Request.Context(), knowledgeID)
++	if err != nil {
++		_ = c.Error(apperrors.NewInternalServerError("Failed to read table metadata").WithDetails(err.Error()))
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
++}
++
++// DataAnalysis executes a read-only statement over one document.
++func (h *KnowledgeDataQueryHandler) DataAnalysis(c *gin.Context) {
++	knowledgeID := c.Param("id")
++	var req dataAnalysisRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		_ = c.Error(apperrors.NewBadRequestError("sql is required").WithDetails(err.Error()))
++		return
++	}
++	result, err := h.service.DataAnalysis(c.Request.Context(), knowledgeID, req.SQL)
++	if err != nil {
++		logger.Warnf(c.Request.Context(), "Tabular data analysis failed for knowledge %s: %v", knowledgeID, err)
++		// The document could not be materialized/loaded (not tabular, missing
++		// file): a caller-visible condition rather than an internal failure.
++		_ = c.Error(apperrors.NewBadRequestError("Document cannot be analyzed").WithDetails(err.Error()))
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
++}
+diff --git a/internal/handler/knowledge_data_query_test.go b/internal/handler/knowledge_data_query_test.go
+new file mode 100644
+index 0000000..46831f5
+--- /dev/null
++++ b/internal/handler/knowledge_data_query_test.go
+@@ -0,0 +1,127 @@
++package handler
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++
++	"github.com/Tencent/WeKnora/internal/middleware"
++	"github.com/Tencent/WeKnora/internal/types"
++	"github.com/Tencent/WeKnora/internal/types/interfaces"
++)
++
++// stubKnowledgeDataQuery stands in for the capability service: it records the
++// arguments the handler passed down and returns a canned result or error.
++type stubKnowledgeDataQuery struct {
++	interfaces.KnowledgeDataQueryService
++	schemaKnowledgeID string
++	analysisKnowledge string
++	analysisSQL       string
++	result            *types.ToolResult
++	err               error
++}
++
++func (s *stubKnowledgeDataQuery) DataSchema(_ context.Context, knowledgeID string) (*types.ToolResult, error) {
++	s.schemaKnowledgeID = knowledgeID
++	return s.result, s.err
++}
++
++func (s *stubKnowledgeDataQuery) DataAnalysis(_ context.Context, knowledgeID string, sqlText string) (*types.ToolResult, error) {
++	s.analysisKnowledge = knowledgeID
++	s.analysisSQL = sqlText
++	return s.result, s.err
++}
++
++func newDataQueryTestEngine(svc interfaces.KnowledgeDataQueryService) *gin.Engine {
++	gin.SetMode(gin.TestMode)
++	r := gin.New()
++	// The production envelope/status for recorded c.Error() values comes from
++	// ErrorHandler; reusing it keeps this test honest about status codes.
++	r.Use(middleware.ErrorHandler())
++	h := NewKnowledgeDataQueryHandler(svc)
++	r.GET("/knowledge/:id/data-schema", h.DataSchema)
++	r.POST("/knowledge/:id/data-analysis", h.DataAnalysis)
++	return r
++}
++
++func okToolResult() *types.ToolResult {
++	return &types.ToolResult{
++		Success: true,
++		Output:  "table: d1\ncolumns: region, amount",
++		Data:    map[string]interface{}{"row_count": 2},
++	}
++}
++
++func TestDataSchemaReturnsToolResultForRequestedKnowledge(t *testing.T) {
++	stub := &stubKnowledgeDataQuery{result: okToolResult()}
++	w := httptest.NewRecorder()
++	newDataQueryTestEngine(stub).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/knowledge/k1/data-schema", nil))
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
++	}
++	if stub.schemaKnowledgeID != "k1" {
++		t.Fatalf("service received knowledge %q, want %q", stub.schemaKnowledgeID, "k1")
++	}
++	var body struct {
++		Success bool              `json:"success"`
++		Data    *types.ToolResult `json:"data"`
++	}
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatalf("decode response: %v (body %s)", err, w.Body.String())
++	}
++	if !body.Success || body.Data == nil || body.Data.Output != "table: d1\ncolumns: region, amount" {
++		t.Fatalf("unexpected body: %s", w.Body.String())
++	}
++}
++
++func TestDataAnalysisRejectsMissingSQL(t *testing.T) {
++	stub := &stubKnowledgeDataQuery{result: okToolResult()}
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/knowledge/k1/data-analysis", strings.NewReader(`{}`))
++	req.Header.Set("Content-Type", "application/json")
++	newDataQueryTestEngine(stub).ServeHTTP(w, req)
++
++	if w.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
++	}
++	if stub.analysisSQL != "" {
++		t.Fatalf("service must not be called without sql, saw %q", stub.analysisSQL)
++	}
++}
++
++func TestDataAnalysisPassesSQLAndKnowledgeThrough(t *testing.T) {
++	stub := &stubKnowledgeDataQuery{result: okToolResult()}
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/knowledge/k7/data-analysis", strings.NewReader(`{"sql":"select region, sum(amount) from d7 group by 1"}`))
++	req.Header.Set("Content-Type", "application/json")
++	newDataQueryTestEngine(stub).ServeHTTP(w, req)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
++	}
++	if stub.analysisKnowledge != "k7" || stub.analysisSQL != "select region, sum(amount) from d7 group by 1" {
++		t.Fatalf("service received (%q, %q)", stub.analysisKnowledge, stub.analysisSQL)
++	}
++}
++
++func TestDataAnalysisReportsUnanalyzableDocumentAsBadRequest(t *testing.T) {
++	stub := &stubKnowledgeDataQuery{err: fmt.Errorf("document k9 cannot be loaded for analysis: unsupported file type")}
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/knowledge/k9/data-analysis", strings.NewReader(`{"sql":"select 1"}`))
++	req.Header.Set("Content-Type", "application/json")
++	newDataQueryTestEngine(stub).ServeHTTP(w, req)
++
++	if w.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
++	}
++	if !strings.Contains(w.Body.String(), "cannot be analyzed") {
++		t.Fatalf("body should explain the document cannot be analyzed: %s", w.Body.String())
++	}
++}
+diff --git a/internal/router/router.go b/internal/router/router.go
+index 1e587b5..b6e01b2 100644
+--- a/internal/router/router.go
++++ b/internal/router/router.go
+@@ -42,6 +42,7 @@ type RouterParams struct {
+ 	AgentShareService            interfaces.AgentShareService
+ 	KBHandler                    *handler.KnowledgeBaseHandler
+ 	KnowledgeHandler             *handler.KnowledgeHandler
++	KnowledgeDataQueryHandler    *handler.KnowledgeDataQueryHandler
+ 	TenantHandler                *handler.TenantHandler
+ 	TenantService                interfaces.TenantService
+ 	TenantAPIKeyService          interfaces.TenantAPIKeyService
+@@ -259,7 +260,7 @@ func NewRouter(params RouterParams) *gin.Engine {
+ 			params.ResourceCatalog,
+ 		)
+ 		RegisterKnowledgeTagRoutes(v1, params.TagHandler, rbacGuards)
+-		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, rbacGuards)
++		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, params.KnowledgeDataQueryHandler, rbacGuards)
+ 		RegisterFAQRoutes(v1, params.FAQHandler, rbacGuards)
+ 		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)
+ 		RegisterSessionRoutes(v1, params.SessionHandler, params.MessageSuggestionHandler, rbacGuards)
+diff --git a/internal/router/router_api_key_capabilities_test.go b/internal/router/router_api_key_capabilities_test.go
+index 6fa54a4..90c164e 100644
+--- a/internal/router/router_api_key_capabilities_test.go
++++ b/internal/router/router_api_key_capabilities_test.go
+@@ -292,7 +292,7 @@ func TestKnowledgeReadRoutesDeclareRetrieveCapability(t *testing.T) {
+ 	v1 := gin.New().Group("/api/v1")
+ 
+ 	RegisterKnowledgeBaseRoutes(v1, &handler.KnowledgeBaseHandler{}, g)
+-	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, g)
++	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, &handler.KnowledgeDataQueryHandler{}, g)
+ 	RegisterFAQRoutes(v1, &handler.FAQHandler{}, g)
+ 	RegisterKnowledgeTagRoutes(v1, &handler.TagHandler{}, g)
+ 	RegisterChatRoutes(v1, &sessionhandler.Handler{}, g)
+@@ -309,6 +309,8 @@ func TestKnowledgeReadRoutesDeclareRetrieveCapability(t *testing.T) {
+ 		{http.MethodGet, "/api/v1/knowledge-bases/:id/knowledge"},
+ 		{http.MethodGet, "/api/v1/knowledge/:id"},
+ 		{http.MethodGet, "/api/v1/knowledge/:id/download"},
++		{http.MethodGet, "/api/v1/knowledge/:id/data-schema"},
++		{http.MethodPost, "/api/v1/knowledge/:id/data-analysis"},
+ 		{http.MethodPost, "/api/v1/knowledge-bases/:id/faq/search"},
+ 		{http.MethodGet, "/api/v1/knowledge-bases/:id/tags"},
+ 		{http.MethodPost, "/api/v1/knowledge-search"},
+@@ -590,7 +592,7 @@ func TestKnowledgeBatchWriteRoutesDeclareIngestCapability(t *testing.T) {
+ 	g := &rbacGuards{}
+ 	v1 := gin.New().Group("/api/v1")
+ 
+-	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, g)
++	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, &handler.KnowledgeDataQueryHandler{}, g)
+ 
+ 	cases := []struct {
+ 		method string
+diff --git a/internal/router/router_knowledge_download_test.go b/internal/router/router_knowledge_download_test.go
+index 0d0438a..751e9cb 100644
+--- a/internal/router/router_knowledge_download_test.go
++++ b/internal/router/router_knowledge_download_test.go
+@@ -73,7 +73,7 @@ func newKnowledgeDownloadRouteTestEngine(
+ 		c.Set(types.TenantIDContextKey.String(), uint64(1))
+ 		c.Next()
+ 	})
+-	RegisterKnowledgeRoutes(r.Group("/api/v1"), &handler.KnowledgeHandler{}, guards)
++	RegisterKnowledgeRoutes(r.Group("/api/v1"), &handler.KnowledgeHandler{}, &handler.KnowledgeDataQueryHandler{}, guards)
+ 	return r
+ }
+ 
+diff --git a/internal/router/routes_knowledge.go b/internal/router/routes_knowledge.go
+index dc11aa4..7b07984 100644
+--- a/internal/router/routes_knowledge.go
++++ b/internal/router/routes_knowledge.go
+@@ -64,7 +64,7 @@ func RegisterChunkRoutes(r *gin.RouterGroup, handler *handler.ChunkHandler, g *r
+ // reuse OwnedKBOrAdmin because the URL :id is the KB id directly.
+ // Cross-:id batch operations stay Contributor-gated — they don't have
+ // a single owning KB to check against.
+-func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, g *rbacGuards) {
++func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, dataQueryHandler *handler.KnowledgeDataQueryHandler, g *rbacGuards) {
+ 	// 知识库下的知识路由组（URL :id is the KB id）。Scoped API key 需要
+ 	// ingest 能力才能写内容，且仍受 KB 范围限制；清空 KB 只允许 full-access key。
+ 	kb := g.apiKeyGroup(r.Group("/knowledge-bases/:id/knowledge"), apiKeyIngest(apiKeyFullAccess()))
+@@ -103,6 +103,12 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
+ 		kRead.GET("/:id", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledge)
+ 		kRead.GET("/:id/stages", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledgeSpans)
+ 		kRead.GET("/:id/spans", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledgeSpans)
++		// Tabular-data capability endpoints (ADR-0019 D-18 E2/E3): the same DuckDB
++		// execution path the built-in agent's data tools use, with the caller
++		// (not an agent) planning the query. Retrieve capability + KB read scope,
++		// so they grant nothing the caller could not already read.
++		kRead.GET("/:id/data-schema", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), dataQueryHandler.DataSchema)
++		kRead.POST("/:id/data-analysis", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), dataQueryHandler.DataAnalysis)
+ 		k.DELETE("/:id", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.DeleteKnowledge)
+ 		k.PUT("/:id", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.UpdateKnowledge)
+ 		k.POST("/:id/regenerate-summary", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.RegenerateKnowledgeSummary)
+diff --git a/internal/types/interfaces/knowledge_data_query.go b/internal/types/interfaces/knowledge_data_query.go
+new file mode 100644
+index 0000000..0399a94
+--- /dev/null
++++ b/internal/types/interfaces/knowledge_data_query.go
+@@ -0,0 +1,29 @@
++package interfaces
++
++import (
++	"context"
++
++	"github.com/Tencent/WeKnora/internal/types"
++)
++
++// KnowledgeDataQueryService exposes the engine's tabular-data capabilities for a
++// single ingested document, without an agent in the call path.
++//
++// The endpoints that back this service exist so an external orchestrator can plan
++// a query itself and still have the engine do the execution — keeping exactly one
++// implementation of the data stack (ADR-0019 D-16/D-18 E2/E3).
++//
++//   - DataSchema returns what ingestion recorded about the document's table
++//     (table name, columns, row count) so a caller can write SQL against it.
++//   - DataAnalysis executes a read-only SQL statement over that document's data
++//     in the process-wide DuckDB instance.
++//
++// Both are the same code paths the built-in agent's data_analysis / data_schema
++// tools use; the service only supplies the caller's scope and removes the agent
++// planning loop.
++type KnowledgeDataQueryService interface {
++	// DataSchema returns the table metadata of one document.
++	DataSchema(ctx context.Context, knowledgeID string) (*types.ToolResult, error)
++	// DataAnalysis executes sqlText (read-only) over one document.
++	DataAnalysis(ctx context.Context, knowledgeID string, sqlText string) (*types.ToolResult, error)
++}

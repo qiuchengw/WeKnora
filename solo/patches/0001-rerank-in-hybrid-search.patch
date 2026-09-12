@@ -247,7 +247,3 @@ index daceb90..885fda8 100644
  }
  
  // Value implements the driver.Valuer interface, used to convert SearchResult to database value
-diff --git a/solo/patches/0001-strip-stage1.patch b/solo/patches-optional/0001-strip-stage1.patch
-similarity index 100%
-rename from solo/patches/0001-strip-stage1.patch
-rename to solo/patches-optional/0001-strip-stage1.patch
