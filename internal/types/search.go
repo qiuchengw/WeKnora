@@ -249,6 +249,12 @@ type SearchParams struct {
 	// in processSearchResults. Used by the chat pipeline where context assembly
 	// is handled separately in the merge stage.
 	SkipContextEnrichment bool `json:"skip_context_enrichment,omitempty"`
+	// EnableRerank reranks the fused results with the tenant's configured
+	// rerank model (RetrievalConfig.RerankModelID) before returning them, so a
+	// caller that only wants retrieval still gets rerank-quality ordering.
+	// No model configured, or a failed model call, leaves the fused order
+	// untouched — search never fails because of rerank.
+	EnableRerank bool `json:"enable_rerank,omitempty"`
 }
 
 // Value implements the driver.Valuer interface, used to convert SearchResult to database value

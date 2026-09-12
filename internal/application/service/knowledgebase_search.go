@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
@@ -297,7 +298,87 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 		deduplicatedChunks = deduplicatedChunks[:params.MatchCount]
 	}
 
-	return s.processSearchResults(ctx, deduplicatedChunks, params.SkipContextEnrichment)
+	processed, err := s.processSearchResults(ctx, deduplicatedChunks, params.SkipContextEnrichment)
+	if err != nil {
+		return nil, err
+	}
+	if params.EnableRerank {
+		processed = s.applyRerank(ctx, retrievalCfg, params.QueryText, processed)
+	}
+	return processed, nil
+}
+
+// applyRerank reorders fused search results with the tenant's configured rerank
+// model. It is a no-op when no model is configured; when the model lookup or the
+// model call fails it logs and returns the fused order, so a rerank outage
+// degrades ordering instead of failing the search. Results beyond RerankTopK are
+// appended unchanged after the reranked prefix, and entries scoring below
+// RerankThreshold are dropped — the same shape messageService.rerankResults
+// applies to message search.
+func (s *knowledgeBaseService) applyRerank(ctx context.Context, cfg *types.RetrievalConfig, query string, results []*types.SearchResult) []*types.SearchResult {
+	if cfg == nil || cfg.RerankModelID == "" || len(results) == 0 {
+		return results
+	}
+	reranker, err := s.modelService.GetRerankModel(ctx, cfg.RerankModelID)
+	if err != nil {
+		logger.Warnf(ctx, "HybridSearch rerank skipped: resolve model %s failed: %v", cfg.RerankModelID, err)
+		return results
+	}
+	topK := cfg.GetEffectiveRerankTopK()
+	if topK <= 0 || topK > len(results) {
+		topK = len(results)
+	}
+	passages := make([]string, topK)
+	for i := range topK {
+		passages[i] = rerankPassage(results[i])
+	}
+	ranked, err := reranker.Rerank(ctx, query, passages)
+	if err != nil {
+		logger.Warnf(ctx, "HybridSearch rerank skipped: model call failed: %v", err)
+		return results
+	}
+	threshold := cfg.GetEffectiveRerankThreshold()
+	reordered := make([]*types.SearchResult, 0, len(results))
+	placed := make([]bool, topK)
+	for _, rr := range ranked {
+		if rr.Index < 0 || rr.Index >= topK || placed[rr.Index] {
+			continue
+		}
+		placed[rr.Index] = true
+		if rr.RelevanceScore < threshold {
+			continue
+		}
+		reordered = append(reordered, results[rr.Index])
+	}
+	// Keep candidates the model did not place (still retrieval hits), then the
+	// untouched tail beyond RerankTopK.
+	for i := range topK {
+		if !placed[i] {
+			reordered = append(reordered, results[i])
+		}
+	}
+	return append(reordered, results[topK:]...)
+}
+
+// rerankPassage builds the text handed to the rerank model: the knowledge title
+// (when known) followed by the chunk content.
+//
+// Why the title: chunk bodies routinely omit the document identity, so a
+// title-shaped query has nothing to match against once the title is dropped —
+// reranking then pushes a correctly retrieved document below lower-quality
+// neighbours (measured: title-probe MRR 1.00 -> 0.50 on a 27-document corpus).
+// Message search carries no title and keeps its plain content passage.
+func rerankPassage(result *types.SearchResult) string {
+	title := strings.TrimSpace(result.KnowledgeTitle)
+	content := strings.TrimSpace(result.Content)
+	switch {
+	case title == "":
+		return result.Content
+	case content == "":
+		return title
+	default:
+		return title + "\n" + content
+	}
 }
 
 // normalizedMatchCount resolves the effective primary-match cap for a search.
