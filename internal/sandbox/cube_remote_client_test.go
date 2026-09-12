@@ -35,7 +35,28 @@ func TestCubeRemoteClientProviderAndCapabilities(t *testing.T) {
 		SupportsTimeoutRefresh:        true,
 		SupportsFilesystemEnumeration: true,
 		SupportsSnapshots:             true,
+		SupportsTerminals:             true,
 	}, client.Capabilities())
+}
+
+func TestCubeCommandTimeoutIsIndependentOfHTTPTimeout(t *testing.T) {
+	mock := newCubeMockServer(t)
+	mock.executor = func(string, string, []string) (string, string, int) {
+		time.Sleep(300 * time.Millisecond)
+		return "finished", "", 0
+	}
+	cfg := testConfig(t, mock)
+	cfg.CubeHTTPTimeout = 100 * time.Millisecond
+	client, err := NewCubeRemoteClient(cfg)
+	require.NoError(t, err)
+	handle, err := client.Create(context.Background(), RemoteCreateRequest{TemplateID: "template-a"})
+	require.NoError(t, err)
+	result, err := client.Exec(context.Background(), handle, RemoteExecRequest{
+		Command: "slow command", Shell: true, Timeout: 2 * time.Second,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "finished", result.Stdout)
+	require.False(t, result.Killed)
 }
 
 func TestCubeRemoteClientCreateSnapshot(t *testing.T) {

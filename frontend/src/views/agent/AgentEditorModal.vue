@@ -219,6 +219,7 @@
                             class="required">*</span></label>
                         <p class="desc">{{ $t('agentEditor.desc.systemPrompt') }}{{ isBuiltinAgent ?
                           $t('agentEditor.desc.leaveEmptyDefault') : '' }}</p>
+                        <p class="desc">{{ $t('agentEditor.desc.promptInheritance') }}</p>
                         <div class="placeholder-tags">
                           <span class="placeholder-label">{{ $t('agentEditor.placeholders.available') }}</span>
                           <t-tooltip v-for="placeholder in availablePlaceholders" :key="placeholder.name"
@@ -1833,6 +1834,7 @@ import {
 } from '@/config/contextualGuides';
 import { useI18n } from 'vue-i18n';
 import { selectInitialModelId } from '@/utils/modelDefaults';
+import { hydrateAgentPromptRefs, serializeAgentPrompts } from '@/utils/agentPromptTemplates';
 import { copyWithToast } from '@/utils/clipboard';
 import { MessagePlugin } from 'tdesign-vue-next';
 import {
@@ -2031,6 +2033,7 @@ const kbOptions = ref<{ label: string; value: string; type?: 'document' | 'faq';
 const agentTypePresets = ref<AgentTypePreset[]>([]);
 // Agent 系统提示词模板缓存（用于切换智能体类型时根据 system_prompt_id 解析出实际文本填入）
 const agentSystemPromptTemplates = ref<PromptTemplate[]>([]);
+const promptTemplates = ref<PromptTemplatesConfig | null>(null);
 const intentPromptTemplates = ref<PromptTemplate[]>([]);
 type McpSelectOption = { label: string; value: string; disabled?: boolean };
 
@@ -2357,7 +2360,7 @@ const defaultMaxCompletionTokensFor = (mode: string, sandboxConfigId?: string) =
 };
 
 // 知识库相关工具列表（用于 watch(hasKnowledgeBase) 从"无"变"有"时 seed 默认工具）
-const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'query_knowledge_graph', 'get_document_info', 'database_query'];
+const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'get_document_info'];
 
 // Wiki 读取类工具（用于 watch(agentMode) 切到 smart-reasoning 时 seed 默认工具）
 const wikiReadTools = ['wiki_search', 'wiki_read_page', 'wiki_read_source_doc', 'wiki_flag_issue'];
@@ -3453,6 +3456,7 @@ watch(() => props.visible, async (val) => {
 
       // 设置初始化标志，防止 watch 自动添加工具
       isInitializing.value = true;
+      agentData.config = hydrateAgentPromptRefs(agentData.config, promptTemplates.value);
       formData.value = agentData;
       if (agentData.config.max_iterations > 1) {
         lastFiniteMaxIterations.value = agentData.config.max_iterations;
@@ -3465,10 +3469,8 @@ watch(() => props.visible, async (val) => {
       nextTick(() => {
         isInitializing.value = false;
       });
-      // 内置智能体：如果提示词为空，填入系统默认值
-      if (agentData.is_builtin) {
-        fillBuiltinAgentDefaults();
-      }
+      // Display inherited defaults for all agents without persisting a copy.
+      fillBuiltinAgentDefaults();
       void loadAgentIntegrationCounts(agentData.id);
     } else {
       // 创建新智能体，使用系统默认值
@@ -3719,14 +3721,7 @@ watch(agentMode, (val, _oldVal) => {
     if (formData.value.config.allowed_tools.length === 0) {
       const tools: string[] = [];
       if (hasRagKnowledgeBase.value) {
-        tools.push(
-          'knowledge_search',
-          'grep_chunks',
-          'list_knowledge_chunks',
-          'query_knowledge_graph',
-          'get_document_info',
-          'database_query',
-        );
+        tools.push(...knowledgeBaseTools);
       }
       if (hasWikiKnowledgeBase.value) {
         tools.push(...wikiReadTools);
@@ -3854,6 +3849,7 @@ const mapKbToOption = (kb: any, shared: boolean, orgName?: string) => {
 };
 
 const applyPromptTemplateDefaults = (cfg: PromptTemplatesConfig | null) => {
+  promptTemplates.value = cfg;
   if (!cfg) return;
   if (cfg.agent_system_prompt && Array.isArray(cfg.agent_system_prompt)) {
     agentSystemPromptTemplates.value = cfg.agent_system_prompt;
@@ -4688,6 +4684,7 @@ watch(() => props.visible, (val) => {
 // 模板选择处理函数
 const handleSystemPromptTemplateSelect = (template: PromptTemplate) => {
   formData.value.config.system_prompt = template.content;
+  formData.value.config.system_prompt_id = template.id;
 };
 
 // Agent 系统提示词的"恢复默认"：
@@ -4716,6 +4713,7 @@ const handleAgentSystemPromptResetDefault = (fallback: PromptTemplate) => {
 
 const handleContextTemplateSelect = (template: PromptTemplate) => {
   formData.value.config.context_template = template.content;
+  formData.value.config.context_template_id = template.id;
 };
 
 const handleRewriteTemplateSelect = (template: PromptTemplate) => {
@@ -4819,10 +4817,11 @@ const handleSave = async () => {
 
   pruneSelectedSkills()
 
+  const payload = { ...formData.value, config: serializeAgentPrompts(formData.value.config, promptTemplates.value) };
   saving.value = true;
   try {
     if (editorMode.value === 'create') {
-      const result: any = await createAgent(formData.value);
+      const result: any = await createAgent(payload);
       const created = result?.data as CustomAgent | undefined;
       if (!created?.id) {
         throw new Error(result?.message || t('agent.messages.saveFailed'));
@@ -4835,7 +4834,7 @@ const handleSave = async () => {
       MessagePlugin.success(t('agent.messages.created'));
       emit('success', created);
     } else {
-      await updateAgent(formData.value.id, formData.value);
+      await updateAgent(formData.value.id, payload);
       MessagePlugin.success(t('agent.messages.updated'));
       emit('success');
       handleClose();
