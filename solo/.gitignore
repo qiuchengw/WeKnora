@@ -1,0 +1,2 @@
+# 构建输入头（由 scripts/build-windows.sh 生成，不进源码树）
+.build-headers/
