@@ -24,8 +24,9 @@
 ```
 solo/
   README.md                   本文件（车道说明 + 升级流程）
-  patches/0001-strip-stage1.patch   【可选，默认不启用】阶段 1 剥离（DuckDB / 数据分析工具 / 表格摘要服务）
-  scripts/build-windows.sh    Windows/amd64 构建（默认零补丁；生成 sqlite3.h → 编译）
+  patches/0001-rerank-in-hybrid-search.patch   【默认启用】能力补丁：hybrid-search 支持 enable_rerank
+  patches-optional/0001-strip-stage1.patch     【--with-strip 才启用】体积补丁（DuckDB/数据分析/表格摘要）
+  scripts/build-windows.sh    Windows/amd64 构建（应用补丁 → 生成 sqlite3.h → 编译）
 .github/workflows/solo-lite-windows.yml   CI：windows-latest 出活 + SHA256
 ```
 
@@ -33,35 +34,42 @@ solo/
 
 ```bash
 # 本机（Windows，Git Bash 或 msys2）：
-bash solo/scripts/build-windows.sh                 # 零补丁（canonical）→ dist/WeKnora-lite.exe
+bash solo/scripts/build-windows.sh                 # 上游 tag + patches/ → dist/WeKnora-lite.exe
+bash solo/scripts/build-windows.sh --no-patches     # 纯上游原版（对照/验证用）
+bash solo/scripts/build-windows.sh --with-strip     # 额外剥离能力（体积应急）
 bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号表）
-bash solo/scripts/build-windows.sh --with-patches   # 可选：出剥离版（体积极敏场景）
 ```
 
 工具链发现顺序：`MINGW_BIN` 环境变量 → `PATH` 上的 `gcc`。CI 用 msys2 `UCRT64`。
 
-产物纪律：每个发布物记录 **上游 tag + 本车道 commit + 是否启用补丁 + 构建命令 + SHA256 + 许可清单**。
+产物纪律：每个发布物记录 **上游 tag + 本车道 commit + 启用补丁清单 + 构建命令 + SHA256 + 许可清单**。
 
-## 剥离补丁（可选，默认不启用）
+## 补丁策略（能力补丁默认启用 / 体积补丁可选）
 
-`patches/0001-strip-stage1.patch` = 18 文件 / −2472 行（DuckDB + 数据分析工具/管道 + 表格摘要任务与入队点 + 悬空 `data_schema`）。
-**能力面影响已消解**：`data_analysis`/`data_schema` 是引擎**内置 Agent** 的工具，我们**不使用也不配置**（问数改由宿主 Agent 用已在栈内的 DuckDB 实现，见 ADR-0019 D-16）⇒ 剥离仅影响体积，不影响本产品能力。不要为了体积默认启用。
+**边界铁律（ADR-0019 D-16）**：引擎已具备的能力一律由引擎提供，宿主**不自建**。当上游只把能力藏在「内置 Agent」里、未暴露成独立端点时，我们的动作是**改造引擎**（能力端点化），而不是在宿主重写一份。
 
-## 升级流程（上游出新 tag 时）——零补丁、零人工
+- `patches/`（默认启用）：**能力补丁**——附加式、每项对应一个上游 PR/Issue，上游合并后即删。当前：
+  - `0001-rerank-in-hybrid-search.patch`：`SearchParams.enable_rerank` + `HybridSearch` 在融合后调用 tenant 配置的 rerank 模型（含单测 5 例；失败回退融合顺序）。
+- `patches-optional/`（`--with-strip` 才启用）：**体积补丁**——删除 Lite 不可达能力（DuckDB 数据分析工具/表格摘要任务/悬空 `data_schema`）。仅当体积/内存成为发布阻塞时用；与能力无关（剥离后问数、rerank 走引擎新端点，不受影响）。
+
+## 升级流程（上游出新 tag 时）
 
 ```bash
 git fetch origin --tags                    # origin = 上游 Tencent/WeKnora
 git checkout -b solo-v0.9 origin/v0.9       # 基线：新 tag
 git checkout solo -- solo/ .github/workflows/solo-lite-windows.yml
-bash solo/scripts/build-windows.sh          # 直接构建（默认零补丁），无需刷任何补丁
+bash solo/scripts/build-windows.sh          # 自动应用 patches/；冲突则显式报错退出
 ```
 
-- 默认路径**不碰源码** ⇒ 不存在补丁冲突；CI 红/绿即可判定新 tag 可用性。
-- 若启用 `--with-patches`：补丁主体是整文件删除（极少冲突），少量 hunk 在调用点；`git apply --check` 失败时脚本**立即报错退出**（不静默兜底），用 `git apply --3way` 刷新补丁。
-- 真要系统性瘦身：**向上游提 build tag PR**（把不可达能力（云向量库/IM/沙箱/内置 Agent 面）改为可选编译）——一次性、零本地维护。
+- `patches/` 是**附加式小补丁**（当前 3 文件 / +220 行），每项都有对应上游 PR；上游合并后补丁退役 ⇒ 冲突面随时间收敛。
+- 若 `git apply --check` 失败，脚本**立即报错退出**（不静默兜底）：用 `git apply --3way` 刷新补丁。
+- 长期零维护路径：上游接受能力端点 PR（工具端点化 + `enable_rerank`）后，`patches/` 清空。
 
-## 已知待办（后续阶段）
+## 已知待办（能力端点化路线）
 
-- **体积极化（仅当成为阻塞）**：先试上游 build tag PR；剥离补丁只是应急开关。
-- **问数（ADR-0019 D-16，若产品要做）**：**宿主侧实现**（宿主 DuckDB `@duckdb/node-api`，CSV 聚合已实测；xlsx 需离线扩展或 JS 解析方案）——**不经过引擎 agent**，无需引擎侧配置。
+目标形态：**宿主 Agent（唯一编排） + 引擎（无 agent 的纯能力面）**。
+
+- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排，本车道补丁）。
+- 待补（引擎侧，附加式）：**问数执行端点**（把内置 Agent 的 `data_analysis`/`data_schema` 工具暴露为独立 HTTP 能力；宿主只做「问题→SQL」的规划，DuckDB 执行与表格解析留在引擎）；可选通用化：`POST /engine-tools/{tool}` 一次暴露 KB 工具子集。
+- 宿主侧：`KbEnginePort` 收口端点；工具注册走已有 `agent.mastra.tool` 机制；MCP 作为后续可选薄壳。
 - 许可清单随包（`scripts/copy-licenses.sh`）与发布物装配（Solo 侧 W5）。

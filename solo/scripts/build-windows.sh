@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Solo 版 WeKnora Lite（cmd/server，Windows/amd64）构建脚本。
 #
-# 流程：默认**零补丁**（上游源码零改动）→ 生成 sqlite3.h 构建输入头 → CGO 编译
+# 流程：默认应用 patches/（**能力补丁**，附加式：给引擎补上宿主需要、但上游尚未暴露的能力）
+#       → 生成 sqlite3.h 构建输入头 → CGO 编译
 #       （EDITION=lite + sqlite_fts5 + 静态链接 MinGW 运行时）。
-#       `--with-patches` 时才应用 solo/patches/*.patch（体积极敏场景，会影响能力面）。
+#       --with-strip 时额外应用 patches-optional/（体积剥离，应急）。
 #
 # 用法（在仓库根执行）：
-#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols] [--with-patches]
+#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols] [--no-patches] [--with-strip]
 #
 # 工具链：优先 $MINGW_BIN（目录含 gcc.exe），否则要求 PATH 上有 gcc（CI 用 msys2 UCRT64）。
 # 设计纪律：源码树零手改；补丁不能应用也不能回滚时**立即失败**，不做静默兜底。
@@ -16,14 +17,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"      # repo/solo
 SRC="$(cd "$ROOT/.." && pwd)"                  # repo
 OUT_NAME="WeKnora-lite.exe"
 KEEP_SYMBOLS=0
-APPLY_PATCHES=0          # 默认零补丁（ADR-0019 D-15）
+APPLY_PATCHES=1          # 默认应用 patches/（能力补丁，附加式；ADR-0019 D-18）
+APPLY_STRIP=0            # patches-optional/ 仅在 --with-strip 时应用（体积极敏场景）
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT_NAME="$2"; shift 2 ;;
     --keep-symbols) KEEP_SYMBOLS=1; shift ;;
+    --no-patches) APPLY_PATCHES=0; APPLY_STRIP=0; shift ;;
+    --with-strip) APPLY_STRIP=1; shift ;;
     --with-patches) APPLY_PATCHES=1; shift ;;
-    --no-patches) APPLY_PATCHES=0; shift ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
 done
@@ -50,6 +53,23 @@ if [ "$APPLY_PATCHES" = 1 ]; then
       echo ">> patch already applied: $name"
     else
       echo "错误：$name 既不能应用也不处于已应用状态——上游代码已变化，请刷新补丁（git apply --3way）" >&2
+      exit 1
+    fi
+  done
+fi
+
+# 1c) 体积补丁（patches-optional/，需 --with-strip）：删除 Lite 不可达能力，仅当体积成为发布阻塞时用。
+if [ "$APPLY_STRIP" = 1 ]; then
+  for p in "$ROOT"/patches-optional/*.patch; do
+    [ -e "$p" ] || continue
+    name="optional/$(basename "$p")"
+    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
+      git -C "$SRC" apply "$p"
+      echo ">> patch applied: $name"
+    elif git -C "$SRC" apply --check -R "$p" 2>/dev/null; then
+      echo ">> patch already applied: $name"
+    else
+      echo "错误：$name 既不能应用也不处于已应用状态——请刷新补丁" >&2
       exit 1
     fi
   done
