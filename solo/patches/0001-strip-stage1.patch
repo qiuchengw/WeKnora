@@ -1,0 +1,2756 @@
+diff --git a/cmd/download/duckdb/duckdb.go b/cmd/download/duckdb/duckdb.go
+deleted file mode 100644
+index 0832752..0000000
+--- a/cmd/download/duckdb/duckdb.go
++++ /dev/null
+@@ -1,38 +0,0 @@
+-package main
+-
+-import (
+-	"context"
+-	"database/sql"
+-	"fmt"
+-
+-	_ "github.com/duckdb/duckdb-go/v2"
+-)
+-
+-// duckdbExtensions is the list of DuckDB extensions required by WeKnora's
+-// data analysis tool. `spatial` is used for layer metadata (st_read_meta)
+-// so we can enumerate sheet names from Excel files, while `excel` provides
+-// the dedicated read_xlsx reader with proper type inference.
+-var duckdbExtensions = []string{"spatial", "excel"}
+-
+-func downloadExtensions() {
+-	ctx := context.Background()
+-
+-	sqlDB, err := sql.Open("duckdb", ":memory:")
+-	if err != nil {
+-		panic(err)
+-	}
+-	defer sqlDB.Close()
+-
+-	for _, ext := range duckdbExtensions {
+-		if _, err := sqlDB.ExecContext(ctx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
+-			panic(fmt.Errorf("failed to install %s extension: %w", ext, err))
+-		}
+-		if _, err := sqlDB.ExecContext(ctx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
+-			panic(fmt.Errorf("failed to load %s extension: %w", ext, err))
+-		}
+-	}
+-}
+-
+-func main() {
+-	downloadExtensions()
+-}
+diff --git a/internal/agent/act.go b/internal/agent/act.go
+index 232a84d..eb240e3 100644
+--- a/internal/agent/act.go
++++ b/internal/agent/act.go
+@@ -172,8 +172,6 @@ var toolDisplayNames = map[string]string{
+ 	agenttools.ToolSearchConversations: "回顾历史对话",
+ 	agenttools.ToolSearchMemory:        "查询长期记忆",
+ 	agenttools.ToolDatabaseQuery:       "查询数据",
+-	agenttools.ToolDataAnalysis:        "数据分析",
+-	agenttools.ToolDataSchema:          "查看数据结构",
+ 	agenttools.ToolWebSearch:           "搜索网页",
+ 	agenttools.ToolWebFetch:            "获取网页",
+ 	agenttools.ToolExecuteSkillScript:  "执行技能脚本",
+diff --git a/internal/agent/tools/data_analysis.go b/internal/agent/tools/data_analysis.go
+deleted file mode 100644
+index 8a45be7..0000000
+--- a/internal/agent/tools/data_analysis.go
++++ /dev/null
+@@ -1,883 +0,0 @@
+-package tools
+-
+-import (
+-	"context"
+-	"database/sql"
+-	"encoding/json"
+-	"fmt"
+-	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
+-	"io"
+-	"os"
+-	"regexp"
+-	"strings"
+-
+-	"github.com/Tencent/WeKnora/internal/logger"
+-	"github.com/Tencent/WeKnora/internal/types"
+-	"github.com/Tencent/WeKnora/internal/types/interfaces"
+-	"github.com/Tencent/WeKnora/internal/utils"
+-)
+-
+-var dataAnalysisTool = BaseTool{
+-	name: ToolDataAnalysis,
+-	description: "Use this tool when the knowledge is CSV or Excel files. It loads the data into memory and executes SQL for data analysis. " +
+-		"For Excel files with multiple sheets, every sheet is loaded into the same table and the source sheet name is exposed as a '__sheet_name' column so you can filter/aggregate per sheet. " +
+-		"If the user's question requires data statistics, convert the question into SQL and execute it.",
+-	schema: utils.GenerateSchema[DataAnalysisInput](),
+-}
+-
+-// excelSheetNameColumn is the name of the synthetic column that identifies
+-// which Excel sheet a row came from when multiple sheets are unioned together.
+-const excelSheetNameColumn = "__sheet_name"
+-
+-// sqlSingleQuoteEscape escapes single quotes in a string so it can be safely
+-// embedded inside a single-quoted SQL literal.
+-func sqlSingleQuoteEscape(s string) string {
+-	return strings.ReplaceAll(s, "'", "''")
+-}
+-
+-func normalizeIdentifierForMatch(s string) string {
+-	normalized := strings.ToLower(strings.TrimSpace(s))
+-	normalized = strings.ReplaceAll(normalized, " ", "")
+-	normalized = strings.ReplaceAll(normalized, "\u3000", "")
+-	return normalized
+-}
+-
+-func reconcileSQLColumnsWithSchema(sqlText string, schema *TableSchema) (string, []string) {
+-	if schema == nil || len(schema.Columns) == 0 {
+-		return sqlText, nil
+-	}
+-
+-	normalizedToCanonical := make(map[string]string, len(schema.Columns))
+-	for _, col := range schema.Columns {
+-		key := normalizeIdentifierForMatch(col.Name)
+-		if key == "" {
+-			continue
+-		}
+-		if _, exists := normalizedToCanonical[key]; !exists {
+-			normalizedToCanonical[key] = col.Name
+-		}
+-	}
+-
+-	quotedIdentifierPattern := regexp.MustCompile(`"([^"]+)"`)
+-	fixes := make([]string, 0)
+-	rewritten := quotedIdentifierPattern.ReplaceAllStringFunc(sqlText, func(token string) string {
+-		name := strings.Trim(token, "\"")
+-		canonical, ok := normalizedToCanonical[normalizeIdentifierForMatch(name)]
+-		if !ok || canonical == name {
+-			return token
+-		}
+-		fixes = append(fixes, fmt.Sprintf("%q -> %q", name, canonical))
+-		return fmt.Sprintf(`"%s"`, canonical)
+-	})
+-
+-	return rewritten, fixes
+-}
+-
+-func buildMissingColumnSuggestion(sqlErr error, schema *TableSchema) string {
+-	if sqlErr == nil || schema == nil {
+-		return ""
+-	}
+-	msg := sqlErr.Error()
+-	if !strings.Contains(msg, `Referenced column "`) || !strings.Contains(msg, `not found`) {
+-		return ""
+-	}
+-
+-	matches := regexp.MustCompile(`Referenced column "([^"]+)" not found`).FindStringSubmatch(msg)
+-	if len(matches) < 2 {
+-		return ""
+-	}
+-
+-	missing := matches[1]
+-	normalizedMissing := normalizeIdentifierForMatch(missing)
+-	if normalizedMissing == "" {
+-		return ""
+-	}
+-
+-	for _, col := range schema.Columns {
+-		if normalizeIdentifierForMatch(col.Name) == normalizedMissing {
+-			return fmt.Sprintf("Column %q does not exist. Did you mean %q? Please use the exact column name from schema.", missing, col.Name)
+-		}
+-	}
+-
+-	return ""
+-}
+-
+-type DataAnalysisInput struct {
+-	KnowledgeID string `json:"knowledge_id" jsonschema:"short dN document ID to query"`
+-	Sql         string `json:"sql" jsonschema:"SQL to be executed on knowledge"`
+-}
+-
+-type DataAnalysisTool struct {
+-	BaseTool
+-	knowledgeBaseService interfaces.KnowledgeBaseService
+-	knowledgeService     interfaces.KnowledgeService
+-	fileService          interfaces.FileService
+-	tenantService        interfaces.TenantService
+-	db                   *sql.DB
+-	sessionID            string
+-	createdTables        []string // Track tables created in this session
+-	// localBaseDir is the LOCAL_STORAGE_BASE_DIR value captured at construction
+-	// time so resolveFileServiceForKnowledge uses the same base path that was
+-	// used when the local FileService was initialised by DI.  Re-reading the
+-	// env var at request time can produce a different (or empty) value if the
+-	// variable was not exported to the sub-process or was set programmatically
+-	// after startup, causing GetFile to look in the wrong directory (#1040).
+-	localBaseDir    string
+-	storageResolver interfaces.StorageBackendResolver
+-	searchTargets   types.SearchTargets
+-	scopeEnforced   bool
+-}
+-
+-// WithSearchTargets enables the Agent-only authorization boundary. Other
+-// internal data-analysis callers retain their existing service-owned scope.
+-// The flag is set independently of the slice length: an Agent turn that ended
+-// up with no search target must reject every document, not fall back to
+-// unrestricted access.
+-func (t *DataAnalysisTool) WithSearchTargets(searchTargets types.SearchTargets) *DataAnalysisTool {
+-	t.searchTargets = searchTargets
+-	t.scopeEnforced = true
+-	return t
+-}
+-
+-func NewDataAnalysisTool(
+-	knowledgeBaseService interfaces.KnowledgeBaseService,
+-	knowledgeService interfaces.KnowledgeService,
+-	tenantService interfaces.TenantService,
+-	fileService interfaces.FileService,
+-	db *sql.DB,
+-	sessionID string,
+-	storageResolvers ...interfaces.StorageBackendResolver,
+-) *DataAnalysisTool {
+-	tool := &DataAnalysisTool{
+-		BaseTool:             dataAnalysisTool,
+-		knowledgeBaseService: knowledgeBaseService,
+-		knowledgeService:     knowledgeService,
+-		fileService:          fileService,
+-		tenantService:        tenantService,
+-		db:                   db,
+-		sessionID:            sessionID,
+-		// Capture LOCAL_STORAGE_BASE_DIR once at construction time so that every
+-		// call to resolveFileServiceForKnowledge uses the same base path.  The
+-		// env var is guaranteed to be set (or empty == "/data/files" fallback)
+-		// when the application starts and the DI container is assembled.
+-		localBaseDir: strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR")),
+-	}
+-	if len(storageResolvers) > 0 {
+-		tool.storageResolver = storageResolvers[0]
+-	}
+-	return tool
+-}
+-
+-// recordCreatedTable records a table name for cleanup, ensuring uniqueness
+-// Returns true if the table was newly recorded, false if it already existed
+-func (t *DataAnalysisTool) recordCreatedTable(tableName string) bool {
+-	for _, name := range t.createdTables {
+-		if name == tableName {
+-			return false
+-		}
+-	}
+-	t.createdTables = append(t.createdTables, tableName)
+-	return true
+-}
+-
+-// Cleanup cleans up the session-specific schema
+-func (t *DataAnalysisTool) Cleanup(ctx context.Context) {
+-	if len(t.createdTables) == 0 {
+-		logger.Infof(ctx, "[Tool][DataAnalysis] No tables to clean up for session: %s", t.sessionID)
+-		return
+-	}
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Cleaning up %d tables for session: %s", len(t.createdTables), t.sessionID)
+-
+-	for _, tableName := range t.createdTables {
+-		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS \"%s\"", tableName)
+-		if _, err := t.db.ExecContext(ctx, dropSQL); err != nil {
+-			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to drop table '%s': %v", tableName, err)
+-			// Continue to drop other tables even if one fails
+-			continue
+-		}
+-		logger.Infof(ctx, "[Tool][DataAnalysis] Successfully dropped table '%s'", tableName)
+-	}
+-
+-	// Clear the list after cleanup
+-	t.createdTables = nil
+-}
+-
+-// Execute executes the SQL query on DuckDB (only read-only queries are allowed)
+-func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Execute started for session: %s", t.sessionID)
+-	var input DataAnalysisInput
+-	if err := json.Unmarshal(args, &input); err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to parse input args: %v", err)
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Failed to parse input args: %v", err),
+-		}, err
+-	}
+-	if t.scopeEnforced {
+-		if _, err := authorizeKnowledgeInSearchTargets(ctx, t.searchTargets, input.KnowledgeID, t.knowledgeService); err != nil {
+-			return &types.ToolResult{Success: false, Error: err.Error()}, err
+-		}
+-	}
+-
+-	schema, err := t.LoadFromKnowledgeID(ctx, input.KnowledgeID)
+-	if err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to load knowledge ID '%s': %v", input.KnowledgeID, err)
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Failed to load knowledge ID '%s': %v", input.KnowledgeID, err),
+-		}, err
+-	}
+-
+-	// Replace knowledge ID with table name
+-	input.Sql = strings.ReplaceAll(input.Sql, input.KnowledgeID, schema.TableName)
+-	if rewrittenSQL, fixes := reconcileSQLColumnsWithSchema(input.Sql, schema); len(fixes) > 0 {
+-		logger.Infof(ctx, "[Tool][DataAnalysis] Auto-rewrote SQL identifiers for session %s: %v", t.sessionID, fixes)
+-		input.Sql = rewrittenSQL
+-	}
+-
+-	// Check if this is a read-only query
+-	normalizedSQL := strings.TrimSpace(strings.ToLower(input.Sql))
+-	isReadOnly := strings.HasPrefix(normalizedSQL, "select") ||
+-		strings.HasPrefix(normalizedSQL, "show") ||
+-		strings.HasPrefix(normalizedSQL, "describe") ||
+-		strings.HasPrefix(normalizedSQL, "explain") ||
+-		strings.HasPrefix(normalizedSQL, "pragma")
+-
+-	if !isReadOnly {
+-		// Reject modification queries
+-		logger.Warnf(ctx, "[Tool][DataAnalysis] Modification query rejected for session %s: %s", t.sessionID, input.Sql)
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   "DuckDB tool only supports read-only queries (SELECT, SHOW, DESCRIBE, EXPLAIN, PRAGMA). Modification operations (INSERT, UPDATE, DELETE, CREATE, DROP, etc.) are not allowed.",
+-		}, fmt.Errorf("modification queries are not allowed")
+-	}
+-
+-	// Validate SQL with comprehensive security checks
+-	// IMPORTANT: Must enable validateSelectStmt to block RangeFunction attacks
+-	_, validation := utils.ValidateSQL(input.Sql,
+-		utils.WithAllowedTables(schema.TableName),
+-		utils.WithSingleStatement(),      // Block multiple statements
+-		utils.WithNoDangerousFunctions(), // Block dangerous functions
+-	)
+-	if !validation.Valid {
+-		logger.Warnf(ctx, "[Tool][DataAnalysis] SQL validation failed for session %s: %v", t.sessionID, validation.Errors)
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("SQL validation failed: %v", validation.Errors),
+-		}, fmt.Errorf("SQL validation failed: %v", validation.Errors)
+-	}
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Received SQL query for session %s: %s", t.sessionID, input.Sql)
+-	// Execute single query and get results
+-	results, err := t.executeSingleQuery(ctx, input.Sql)
+-	if err != nil {
+-		if suggestion := buildMissingColumnSuggestion(err, schema); suggestion != "" {
+-			return &types.ToolResult{
+-				Success: false,
+-				Error:   fmt.Sprintf("Query execution failed: %v. %s", err, suggestion),
+-			}, err
+-		}
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Query execution failed: %v", err),
+-		}, err
+-	}
+-
+-	queryOutput := t.formatQueryResults(results, input.Sql)
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Completed execution query, total %d rows for session %s", len(results), t.sessionID)
+-	return &types.ToolResult{
+-		Success: true,
+-		Output:  queryOutput,
+-		Data: map[string]interface{}{
+-			"rows":         results,
+-			"row_count":    len(results),
+-			"query":        input.Sql,
+-			"display_type": ToolDataAnalysis,
+-			"session_id":   t.sessionID,
+-		},
+-	}, nil
+-}
+-
+-// executeSingleQuery executes a single SQL query and returns columns and results
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - sqlQuery: the SQL query to execute
+-//   - existingColumns: existing column names to merge with (can be nil or empty)
+-//
+-// Returns:
+-//   - []string: merged column names (existing + new columns, deduplicated)
+-//   - []map[string]string: query results
+-//   - error: any error that occurred during execution
+-func (t *DataAnalysisTool) executeSingleQuery(ctx context.Context, sqlQuery string) ([]map[string]string, error) {
+-	rows, err := t.db.QueryContext(ctx, sqlQuery)
+-	if err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Query execution failed: %v", err)
+-		return nil, fmt.Errorf("query execution failed: %w", err)
+-	}
+-	defer rows.Close()
+-
+-	// Get column names
+-	columns, err := rows.Columns()
+-	if err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to get columns: %v", err)
+-		return nil, fmt.Errorf("failed to get columns: %w", err)
+-	}
+-
+-	// Process results
+-	results := make([]map[string]string, 0)
+-	for rows.Next() {
+-		columnValues := make([]interface{}, len(columns))
+-		columnPointers := make([]interface{}, len(columns))
+-		for i := range columnValues {
+-			columnPointers[i] = &columnValues[i]
+-		}
+-
+-		if err := rows.Scan(columnPointers...); err != nil {
+-			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to scan row: %v", err)
+-			return nil, fmt.Errorf("failed to scan row: %w", err)
+-		}
+-
+-		rowMap := make(map[string]string)
+-		for i, colName := range columns {
+-			val := columnValues[i]
+-			// Convert []byte to string for better readability
+-			if b, ok := val.([]byte); ok {
+-				rowMap[colName] = string(b)
+-			} else {
+-				rowMap[colName] = fmt.Sprintf("%v", val)
+-			}
+-		}
+-		results = append(results, rowMap)
+-	}
+-
+-	if err := rows.Err(); err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Error iterating rows: %v", err)
+-		return nil, fmt.Errorf("error iterating rows: %w", err)
+-	}
+-
+-	return results, nil
+-}
+-
+-// formatQueryResults formats query results into JSONL format (one JSON object per line)
+-func (t *DataAnalysisTool) formatQueryResults(results []map[string]string, query string) string {
+-	var output strings.Builder
+-
+-	output.WriteString("=== DuckDB Query Results ===\n\n")
+-	output.WriteString(fmt.Sprintf("Executed SQL: %s\n\n", query))
+-	output.WriteString(fmt.Sprintf("Returned %d rows\n\n", len(results)))
+-
+-	if len(results) == 0 {
+-		output.WriteString("No matching records found.\n")
+-		return output.String()
+-	}
+-
+-	output.WriteString("=== Data Details ===\n\n")
+-	if len(results) > 10 {
+-		output.WriteString(fmt.Sprintf("Showing all %d records. Consider using a LIMIT clause to restrict the result count for better performance.\n\n", len(results)))
+-	}
+-
+-	// Write each record as a separate JSON line
+-	for i, record := range results {
+-		recordBytes, _ := json.Marshal(record)
+-
+-		// Remove the trailing newline added by Encode
+-		recordStr := strings.Trim(string(recordBytes), "\n")
+-		output.WriteString(fmt.Sprintf("record %d: %s\n", i+1, recordStr))
+-	}
+-
+-	return output.String()
+-}
+-
+-// TableSchema represents the schema information of a table
+-type TableSchema struct {
+-	TableName string                 `json:"table_name"`
+-	Columns   []ColumnInfo           `json:"columns"`
+-	RowCount  int64                  `json:"row_count"`
+-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+-}
+-
+-// ColumnInfo represents information about a single column
+-type ColumnInfo struct {
+-	Name     string `json:"name"`
+-	Type     string `json:"type"`
+-	Nullable string `json:"nullable"`
+-}
+-
+-// LoadFromCSV loads data from a CSV file into a DuckDB table and returns the table schema
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - filename: path to the CSV file
+-//   - tableName: name of the table to create
+-//
+-// Returns:
+-//   - *TableSchema: schema information of the created table
+-//   - error: any error that occurred during the operation
+-func (t *DataAnalysisTool) LoadFromCSV(ctx context.Context, filename string, tableName string) (*TableSchema, error) {
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Loading CSV file '%s' into table '%s' for session %s", filename, tableName, t.sessionID)
+-
+-	// Record the created table for cleanup. If already exists, skip creation
+-	if t.recordCreatedTable(tableName) {
+-		// Create table from CSV using DuckDB's read_csv_auto function
+-		// with explicit header detection and VARCHAR coercion to align with
+-		// Excel loading behavior.
+-		// Table will be created in the session schema
+-		createTableSQL := fmt.Sprintf(
+-			"CREATE TABLE \"%s\" AS SELECT * FROM read_csv_auto('%s', header=true, all_varchar=true)",
+-			tableName, sqlSingleQuoteEscape(filename),
+-		)
+-
+-		_, err := t.db.ExecContext(ctx, createTableSQL)
+-		if err != nil {
+-			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to create table from CSV: %v", err)
+-			return nil, fmt.Errorf("failed to create table from CSV: %w", err)
+-		}
+-
+-		logger.Infof(ctx, "[Tool][DataAnalysis] Successfully created table '%s' from CSV file in session %s", tableName, t.sessionID)
+-	}
+-
+-	// Get and return the table schema
+-	return t.LoadFromTable(ctx, tableName)
+-}
+-
+-// LoadFromExcel loads data from an Excel file into a DuckDB table and returns the table schema.
+-//
+-// Multi-sheet workbooks are fully supported: every sheet in the workbook is
+-// loaded and the rows from all sheets are unioned (UNION ALL BY NAME) into a
+-// single table. A synthetic '__sheet_name' column is added so downstream SQL
+-// can filter / aggregate per sheet. If sheet enumeration fails for any
+-// reason, we fall back to reading just the first sheet (original behavior).
+-//
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - filename: path to the Excel file
+-//   - tableName: name of the table to create
+-//
+-// Returns:
+-//   - *TableSchema: schema information of the created table
+-//   - error: any error that occurred during the operation
+-//
+-// Note: requires the DuckDB 'excel' extension (for read_xlsx) and the
+-// 'spatial' extension (for st_read_meta used to enumerate sheets).
+-func (t *DataAnalysisTool) LoadFromExcel(ctx context.Context, filename string, tableName string) (*TableSchema, error) {
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Loading Excel file '%s' into table '%s' for session %s", filename, tableName, t.sessionID)
+-
+-	// Record the created table for cleanup. If already exists, skip creation.
+-	if t.recordCreatedTable(tableName) {
+-		sheetNames, enumErr := t.listExcelSheets(ctx, filename)
+-		if enumErr != nil {
+-			logger.Warnf(ctx,
+-				"[Tool][DataAnalysis] Could not enumerate sheets for '%s' (session=%s): %v. Falling back to first sheet only.",
+-				filename, t.sessionID, enumErr,
+-			)
+-		}
+-
+-		createTableSQL := buildExcelCreateTableSQL(tableName, filename, sheetNames)
+-
+-		if _, err := t.db.ExecContext(ctx, createTableSQL); err != nil {
+-			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to create table from Excel (sheets=%v): %v", sheetNames, err)
+-			return nil, fmt.Errorf("failed to create table from Excel file (sheets=%v): %w", sheetNames, err)
+-		}
+-
+-		logger.Infof(ctx,
+-			"[Tool][DataAnalysis] Successfully created table '%s' from Excel file in session %s (sheets=%v)",
+-			tableName, t.sessionID, sheetNames,
+-		)
+-	}
+-
+-	// Get and return the table schema
+-	return t.LoadFromTable(ctx, tableName)
+-}
+-
+-// listExcelSheets returns the names of every sheet (layer) inside the given
+-// Excel workbook by querying DuckDB's spatial st_read_meta table function.
+-// The returned slice preserves the on-disk order of sheets.
+-//
+-// st_read_meta returns a single row whose `layers` column is a LIST of
+-// STRUCTs (one per layer / sheet). We UNNEST that list and project the
+-// struct's `name` field to get a flat list of sheet names.
+-func (t *DataAnalysisTool) listExcelSheets(ctx context.Context, filename string) ([]string, error) {
+-	metaSQL := fmt.Sprintf(
+-		"SELECT UNNEST(layers).name FROM st_read_meta('%s')",
+-		sqlSingleQuoteEscape(filename),
+-	)
+-
+-	rows, err := t.db.QueryContext(ctx, metaSQL)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to query sheet metadata: %w", err)
+-	}
+-	defer rows.Close()
+-
+-	var names []string
+-	for rows.Next() {
+-		var name string
+-		if err := rows.Scan(&name); err != nil {
+-			return nil, fmt.Errorf("failed to scan sheet name: %w", err)
+-		}
+-		if strings.TrimSpace(name) == "" {
+-			continue
+-		}
+-		names = append(names, name)
+-	}
+-	if err := rows.Err(); err != nil {
+-		return nil, fmt.Errorf("error iterating sheet metadata rows: %w", err)
+-	}
+-	return names, nil
+-}
+-
+-// buildExcelCreateTableSQL assembles the CREATE TABLE statement used by
+-// LoadFromExcel. Exposed at package level (lower-case) to make it trivially
+-// testable without a live DuckDB connection.
+-func buildExcelCreateTableSQL(tableName, filename string, sheetNames []string) string {
+-	escFile := sqlSingleQuoteEscape(filename)
+-
+-	// No sheet info (enumeration failed or empty): read the first sheet only.
+-	if len(sheetNames) == 0 {
+-		return fmt.Sprintf(
+-			"CREATE TABLE \"%s\" AS SELECT * FROM read_xlsx('%s', header=true, all_varchar=true)",
+-			tableName, escFile,
+-		)
+-	}
+-
+-	// Single sheet: keep it simple but still tag the source for consistency
+-	// with the multi-sheet path.
+-	if len(sheetNames) == 1 {
+-		escSheet := sqlSingleQuoteEscape(sheetNames[0])
+-		return fmt.Sprintf(
+-			"CREATE TABLE \"%s\" AS SELECT *, '%s' AS %s FROM read_xlsx('%s', sheet = '%s', header=true, all_varchar=true)",
+-			tableName, escSheet, excelSheetNameColumn, escFile, escSheet,
+-		)
+-	}
+-
+-	// Multiple sheets: UNION ALL BY NAME tolerates schema differences
+-	// between sheets (missing columns become NULL, conflicting types are
+-	// widened).
+-	parts := make([]string, 0, len(sheetNames))
+-	for _, sheet := range sheetNames {
+-		escSheet := sqlSingleQuoteEscape(sheet)
+-		parts = append(parts, fmt.Sprintf(
+-			"SELECT *, '%s' AS %s FROM read_xlsx('%s', sheet = '%s', header=true, all_varchar=true)",
+-			escSheet, excelSheetNameColumn, escFile, escSheet,
+-		))
+-	}
+-	return fmt.Sprintf(
+-		"CREATE TABLE \"%s\" AS %s",
+-		tableName,
+-		strings.Join(parts, "\nUNION ALL BY NAME\n"),
+-	)
+-}
+-
+-// LoadFromKnowledge loads data from a Knowledge entity into a DuckDB table and returns the table schema.
+-// It automatically determines the file type and calls the appropriate loading method.
+-//
+-// The source file is first materialized to a local temp file via FileService.GetFile
+-// so DuckDB's st_read / read_xlsx / read_csv_auto can open it directly. This
+-// side-steps provider-specific URL schemes (e.g. the local:// URL returned by
+-// the local file service) that DuckDB's extensions cannot resolve on their own.
+-//
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - knowledge: the Knowledge entity containing file information
+-//
+-// Returns:
+-//   - *TableSchema: schema information of the created table
+-//   - error: any error that occurred during the operation
+-func (t *DataAnalysisTool) LoadFromKnowledge(ctx context.Context, knowledge *types.Knowledge) (*TableSchema, error) {
+-	if knowledge == nil {
+-		return nil, fmt.Errorf("knowledge cannot be nil")
+-	}
+-	tableName := t.TableName(knowledge)
+-
+-	// Normalize file type to lowercase for comparison
+-	fileType := strings.ToLower(knowledge.FileType)
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Loading knowledge '%s' (type: %s) into table '%s' for session %s",
+-		knowledge.ID, fileType, tableName, t.sessionID)
+-
+-	localPath, cleanup, err := t.materializeKnowledgeFile(ctx, knowledge)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to materialize knowledge '%s' for DuckDB: %w", knowledge.ID, err)
+-	}
+-	defer cleanup()
+-
+-	switch fileType {
+-	case "csv":
+-		return t.LoadFromCSV(ctx, localPath, tableName)
+-	case "xlsx", "xls":
+-		return t.LoadFromExcel(ctx, localPath, tableName)
+-	default:
+-		logger.Warnf(ctx, "[Tool][DataAnalysis] Unsupported file type '%s' for knowledge '%s' in session %s",
+-			fileType, knowledge.ID, t.sessionID)
+-		return nil, fmt.Errorf("unsupported file type: %s (supported types: csv, xlsx, xls)", fileType)
+-	}
+-}
+-
+-// materializeKnowledgeFile copies the knowledge's backing blob into a fresh
+-// temp file on the local filesystem so DuckDB can open it with ordinary path
+-// semantics. It returns the temp path and a cleanup closure that removes the
+-// temp file; the closure is always safe to call and is a no-op on failure.
+-//
+-// This hides storage-backend-specific URL schemes (local://, oss://, s3://,
+-// minio://, cos://, …) behind the FileService.GetFile abstraction, so the
+-// Data Analysis tool works identically across all deployments.
+-func (t *DataAnalysisTool) materializeKnowledgeFile(ctx context.Context, knowledge *types.Knowledge) (string, func(), error) {
+-	noop := func() {}
+-
+-	reader, err := t.resolveFileServiceForKnowledge(ctx, knowledge).GetFile(ctx, knowledge.FilePath)
+-	if err != nil {
+-		return "", noop, fmt.Errorf("failed to open file for knowledge '%s': %w", knowledge.ID, err)
+-	}
+-	defer reader.Close()
+-
+-	// Preserve the file extension so DuckDB's format auto-detection still
+-	// works (e.g. the CSV reader expects .csv, xlsx reader expects .xlsx).
+-	suffix := ""
+-	if ext := strings.ToLower(strings.TrimSpace(knowledge.FileType)); ext != "" {
+-		suffix = "." + ext
+-	}
+-
+-	tmp, err := os.CreateTemp("", "weknora-data-analysis-*"+suffix)
+-	if err != nil {
+-		return "", noop, fmt.Errorf("failed to create temp file: %w", err)
+-	}
+-	tmpPath := tmp.Name()
+-	cleanup := func() {
+-		// Best-effort cleanup; a missing file is fine, any other error is
+-		// only logged to avoid masking the original operation's result.
+-		if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+-			logger.Warnf(ctx, "[Tool][DataAnalysis] Failed to remove temp file %s: %v", tmpPath, err)
+-		}
+-	}
+-
+-	if _, err := io.Copy(tmp, reader); err != nil {
+-		_ = tmp.Close()
+-		cleanup()
+-		return "", noop, fmt.Errorf("failed to copy knowledge '%s' to temp file: %w", knowledge.ID, err)
+-	}
+-	if err := tmp.Close(); err != nil {
+-		cleanup()
+-		return "", noop, fmt.Errorf("failed to finalize temp file for knowledge '%s': %w", knowledge.ID, err)
+-	}
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Materialized knowledge '%s' to temp file %s for session %s",
+-		knowledge.ID, tmpPath, t.sessionID)
+-
+-	return tmpPath, cleanup, nil
+-}
+-
+-// LoadFromKnowledgeID loads data from a Knowledge ID into a DuckDB table and returns the table schema
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - knowledgeID: the ID of the Knowledge entity
+-//
+-// Returns:
+-//   - string: the name of the created table
+-//   - *TableSchema: schema information of the created table
+-//   - error: any error that occurred during the operation
+-func (t *DataAnalysisTool) LoadFromKnowledgeID(ctx context.Context, knowledgeID string) (*TableSchema, error) {
+-	// Use GetKnowledgeByIDOnly to support cross-tenant shared KB
+-	knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, knowledgeID)
+-	if err != nil || knowledge == nil {
+-		if err == nil {
+-			err = fmt.Errorf("knowledge service returned an empty result")
+-		}
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to get knowledge by ID '%s': %v", knowledgeID, err)
+-		return nil, fmt.Errorf("failed to get knowledge by ID: %w", err)
+-	}
+-
+-	return t.LoadFromKnowledge(ctx, knowledge)
+-}
+-
+-// LoadFromTable retrieves the schema information of an existing table
+-// Parameters:
+-//   - ctx: context for cancellation and timeout
+-//   - tableName: name of the table to query
+-//
+-// Returns:
+-//   - *TableSchema: schema information of the table
+-//   - error: any error that occurred during the operation
+-//
+-// Note: This function does NOT create the table, it only retrieves schema information
+-func (t *DataAnalysisTool) LoadFromTable(ctx context.Context, tableName string) (*TableSchema, error) {
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Getting schema for table '%s' in session %s", tableName, t.sessionID)
+-
+-	// Query to get column information using PRAGMA table_info or DESCRIBE
+-	schemaSQL := fmt.Sprintf("DESCRIBE \"%s\"", tableName)
+-
+-	rows, err := t.db.QueryContext(ctx, schemaSQL)
+-	if err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to get table schema: %v", err)
+-		return nil, fmt.Errorf("failed to get table schema: %w", err)
+-	}
+-	defer rows.Close()
+-
+-	// Parse column information
+-	columns := make([]ColumnInfo, 0)
+-	for rows.Next() {
+-		var colName, colType, nullable string
+-		var extra1, extra2, extra3 interface{} // DuckDB DESCRIBE may return additional columns
+-
+-		// Try to scan with different column counts
+-		err := rows.Scan(&colName, &colType, &nullable, &extra1, &extra2, &extra3)
+-		if err != nil {
+-			// Try with fewer columns
+-			err = rows.Scan(&colName, &colType, &nullable)
+-			if err != nil {
+-				logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to scan column info: %v", err)
+-				return nil, fmt.Errorf("failed to scan column info: %w", err)
+-			}
+-		}
+-
+-		columns = append(columns, ColumnInfo{
+-			Name:     colName,
+-			Type:     colType,
+-			Nullable: nullable,
+-		})
+-	}
+-
+-	if err := rows.Err(); err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Error iterating schema rows: %v", err)
+-		return nil, fmt.Errorf("error iterating schema rows: %w", err)
+-	}
+-
+-	// Get row count
+-	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM \"%s\"", tableName)
+-	var rowCount int64
+-	if err := t.db.QueryRowContext(ctx, countSQL).Scan(&rowCount); err != nil {
+-		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to get row count: %v", err)
+-		return nil, fmt.Errorf("failed to get row count: %w", err)
+-	}
+-
+-	schema := &TableSchema{
+-		TableName: tableName,
+-		Columns:   columns,
+-		RowCount:  rowCount,
+-		Metadata: map[string]interface{}{
+-			"column_count": len(columns),
+-			"session_id":   t.sessionID,
+-		},
+-	}
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis] Retrieved schema for table '%s' in session %s: %d columns, %d rows",
+-		tableName, t.sessionID, len(columns), rowCount)
+-
+-	return schema, nil
+-}
+-
+-func (t *DataAnalysisTool) TableName(knowledge *types.Knowledge) string {
+-	return "k_" + strings.ReplaceAll(knowledge.ID, "-", "_")
+-}
+-
+-// buildSchemaDescription builds a formatted schema description
+-func (t *TableSchema) Description() string {
+-	var builder strings.Builder
+-	builder.WriteString(fmt.Sprintf("Table name: %s\n", t.TableName))
+-	builder.WriteString(fmt.Sprintf("Columns: %d\n", len(t.Columns)))
+-	builder.WriteString(fmt.Sprintf("Rows: %d\n\n", t.RowCount))
+-	builder.WriteString("Column info:\n")
+-
+-	for _, col := range t.Columns {
+-		builder.WriteString(fmt.Sprintf("- %s (%s)\n", col.Name, col.Type))
+-	}
+-
+-	return builder.String()
+-}
+-
+-// resolveFileServiceForKnowledge resolves a provider-specific FileService based on the knowledge file path.
+-// It falls back to the injected default service when provider/config cannot be resolved.
+-func (t *DataAnalysisTool) resolveFileServiceForKnowledge(ctx context.Context, knowledge *types.Knowledge) interfaces.FileService {
+-	if knowledge == nil {
+-		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] fallback default: session_id=%s reason=knowledge_nil", t.sessionID)
+-		return t.fileService
+-	}
+-
+-	kbID := strings.TrimSpace(knowledge.KnowledgeBaseID)
+-	var kb *types.KnowledgeBase
+-	if t.knowledgeBaseService != nil && kbID != "" {
+-		var err error
+-		kb, err = t.knowledgeBaseService.GetKnowledgeBaseByID(ctx, kbID)
+-		if err != nil {
+-			logger.Warnf(ctx, "[Tool][DataAnalysis][storage] get kb failed, fallback default: session_id=%s knowledge_id=%s kb_id=%s err=%v",
+-				t.sessionID, knowledge.ID, kbID, err)
+-			return t.fileService
+-		}
+-	}
+-	if kb == nil && kbID != "" {
+-		logger.Infof(ctx, "[Tool][DataAnalysis][storage] kb not found, fallback default: session_id=%s knowledge_id=%s kb_id=%s",
+-			t.sessionID, knowledge.ID, kbID)
+-		return t.fileService
+-	}
+-
+-	provider := ""
+-	backendID, _, _ := types.ParseStorageBackendPath(knowledge.FilePath)
+-	if kb != nil {
+-		provider = kb.GetStorageProvider()
+-		if backendID == "" && kb.StorageBackendID != nil {
+-			backendID = strings.TrimSpace(*kb.StorageBackendID)
+-		}
+-	}
+-	tenant, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+-	if tenant == nil {
+-		tenantID := uint64(0)
+-		if tid, ok := ctx.Value(types.TenantIDContextKey).(uint64); ok {
+-			tenantID = tid
+-		}
+-		if tenantID == 0 && kb != nil {
+-			tenantID = knowledge.TenantID
+-		}
+-		if tenantID > 0 && t.tenantService != nil {
+-			resolvedTenant, err := t.tenantService.GetTenantByID(ctx, tenantID)
+-			if err != nil {
+-				logger.Warnf(ctx, "[Tool][DataAnalysis][storage] get tenant failed: session_id=%s knowledge_id=%s kb_id=%s tenant_id=%d err=%v",
+-					t.sessionID, knowledge.ID, kbID, tenantID, err)
+-			} else if resolvedTenant != nil {
+-				tenant = resolvedTenant
+-				logger.Infof(ctx, "[Tool][DataAnalysis][storage] resolved tenant from service: session_id=%s knowledge_id=%s kb_id=%s tenant_id=%d",
+-					t.sessionID, knowledge.ID, kbID, tenantID)
+-			}
+-		}
+-	}
+-	if provider == "" && tenant != nil && tenant.StorageEngineConfig != nil {
+-		provider = strings.ToLower(strings.TrimSpace(tenant.StorageEngineConfig.DefaultProvider))
+-	}
+-	if t.storageResolver != nil && tenant != nil && (backendID != "" || provider != "") {
+-		resolvedSvc, resolvedProvider, err := t.storageResolver.ResolveFileService(
+-			ctx, tenant, backendID, provider, t.localBaseDir,
+-		)
+-		if err == nil {
+-			logger.Infof(ctx, "[Tool][DataAnalysis][storage] resolved storage backend: session_id=%s knowledge_id=%s kb_id=%s backend_id=%s provider=%s",
+-				t.sessionID, knowledge.ID, kbID, backendID, resolvedProvider)
+-			return resolvedSvc
+-		}
+-		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] resolve storage backend failed, trying legacy config: session_id=%s knowledge_id=%s kb_id=%s backend_id=%s provider=%s err=%v",
+-			t.sessionID, knowledge.ID, kbID, backendID, provider, err)
+-	}
+-
+-	if provider == "" || tenant == nil || tenant.StorageEngineConfig == nil {
+-		hasTenantStorageConfig := tenant != nil && tenant.StorageEngineConfig != nil
+-		logger.Infof(ctx, "[Tool][DataAnalysis][storage] fallback default: session_id=%s knowledge_id=%s kb_id=%s provider=%q tenant_cfg=%t",
+-			t.sessionID, knowledge.ID, kbID, provider, hasTenantStorageConfig)
+-		return t.fileService
+-	}
+-
+-	storageConfig := tenant.StorageEngineConfig
+-	// Use the localBaseDir captured at construction time rather than re-reading
+-	// LOCAL_STORAGE_BASE_DIR from os.Getenv here.  Reading the env var at
+-	// request-handling time can produce an empty string (or the wrong value)
+-	// when the variable was set programmatically before startup or is absent
+-	// from the process environment of the DI-constructed sub-component, causing
+-	// the newly created local FileService to use the /data/files fallback
+-	// instead of the configured path and therefore fail to locate files (#1040).
+-	baseDir := t.localBaseDir
+-
+-	resolvedSvc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, storageConfig, baseDir)
+-	if err != nil {
+-		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] create file service failed, fallback default: session_id=%s knowledge_id=%s kb_id=%s provider=%s err=%v",
+-			t.sessionID, knowledge.ID, kbID, provider, err)
+-		return t.fileService
+-	}
+-
+-	logger.Infof(ctx, "[Tool][DataAnalysis][storage] resolved file service: session_id=%s knowledge_id=%s kb_id=%s provider=%s",
+-		t.sessionID, knowledge.ID, kbID, resolvedProvider)
+-	return resolvedSvc
+-}
+diff --git a/internal/agent/tools/data_analysis_duckdb_test.go b/internal/agent/tools/data_analysis_duckdb_test.go
+deleted file mode 100644
+index bc5bd45..0000000
+--- a/internal/agent/tools/data_analysis_duckdb_test.go
++++ /dev/null
+@@ -1,283 +0,0 @@
+-package tools
+-
+-import (
+-	"context"
+-	"database/sql"
+-	"fmt"
+-	"path/filepath"
+-	"testing"
+-
+-	_ "github.com/duckdb/duckdb-go/v2"
+-	"github.com/xuri/excelize/v2"
+-)
+-
+-// newTestDuckDB opens an in-memory DuckDB and loads the extensions the
+-// Data Analysis tool needs. If the extensions can't be installed (e.g. the
+-// test environment has no network), the test is skipped — we can't validate
+-// Excel handling without them.
+-func newTestDuckDB(t *testing.T) *sql.DB {
+-	t.Helper()
+-	db, err := sql.Open("duckdb", ":memory:")
+-	if err != nil {
+-		t.Fatalf("open duckdb: %v", err)
+-	}
+-	t.Cleanup(func() { _ = db.Close() })
+-
+-	ctx := context.Background()
+-	for _, ext := range []string{"spatial", "excel"} {
+-		if _, err := db.ExecContext(ctx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
+-			t.Skipf("cannot install duckdb %s extension (network required): %v", ext, err)
+-		}
+-		if _, err := db.ExecContext(ctx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
+-			t.Skipf("cannot load duckdb %s extension: %v", ext, err)
+-		}
+-	}
+-	return db
+-}
+-
+-// writeWorkbook builds a minimal .xlsx with the given sheet -> rows layout.
+-// Each inner row is a list of cell values; the first row of each sheet is
+-// treated as the header, matching what read_xlsx expects by default.
+-func writeWorkbook(t *testing.T, path string, sheets map[string][][]any, sheetOrder []string) {
+-	t.Helper()
+-	f := excelize.NewFile()
+-	defer func() { _ = f.Close() }()
+-
+-	// Start from a clean slate: we'll add our own sheets in the order
+-	// requested and delete the default Sheet1 at the end if it isn't used.
+-	for idx, name := range sheetOrder {
+-		if _, err := f.NewSheet(name); err != nil {
+-			t.Fatalf("new sheet %q: %v", name, err)
+-		}
+-		rows := sheets[name]
+-		for r, row := range rows {
+-			for c, val := range row {
+-				cell, err := excelize.CoordinatesToCellName(c+1, r+1)
+-				if err != nil {
+-					t.Fatalf("coord (%d,%d): %v", c, r, err)
+-				}
+-				if err := f.SetCellValue(name, cell, val); err != nil {
+-					t.Fatalf("set cell %s on sheet %q: %v", cell, name, err)
+-				}
+-			}
+-		}
+-		if idx == 0 {
+-			sheetIdx, err := f.GetSheetIndex(name)
+-			if err != nil {
+-				t.Fatalf("get sheet index %q: %v", name, err)
+-			}
+-			f.SetActiveSheet(sheetIdx)
+-		}
+-	}
+-
+-	// Delete the default "Sheet1" that excelize.NewFile() creates, unless
+-	// the caller explicitly asked for one.
+-	if _, explicit := sheets["Sheet1"]; !explicit {
+-		if err := f.DeleteSheet("Sheet1"); err != nil {
+-			t.Fatalf("delete default Sheet1: %v", err)
+-		}
+-	}
+-
+-	if err := f.SaveAs(path); err != nil {
+-		t.Fatalf("save workbook: %v", err)
+-	}
+-}
+-
+-// TestLoadFromExcel_MultiSheet is the end-to-end guard for issue #1007:
+-// given a workbook with 2 sheets of different schemas, every row from every
+-// sheet must land in the DuckDB table, and the __sheet_name column must
+-// correctly identify each row's origin.
+-func TestLoadFromExcel_MultiSheet(t *testing.T) {
+-	db := newTestDuckDB(t)
+-
+-	tmp := t.TempDir()
+-	path := filepath.Join(tmp, "multi_sheet.xlsx")
+-
+-	writeWorkbook(t, path,
+-		map[string][][]any{
+-			"Sales": {
+-				{"id", "amount"},
+-				{1, 100},
+-				{2, 250},
+-			},
+-			"Inventory": {
+-				{"sku", "stock"},
+-				{"A", 5},
+-				{"B", 12},
+-				{"C", 7},
+-			},
+-		},
+-		[]string{"Sales", "Inventory"},
+-	)
+-
+-	tool := &DataAnalysisTool{
+-		BaseTool:  dataAnalysisTool,
+-		db:        db,
+-		sessionID: "test-multi-sheet",
+-	}
+-
+-	ctx := context.Background()
+-	schema, err := tool.LoadFromExcel(ctx, path, "t_multi_sheet")
+-	if err != nil {
+-		t.Fatalf("LoadFromExcel: %v", err)
+-	}
+-	t.Cleanup(func() { tool.Cleanup(ctx) })
+-
+-	// 2 sheets × (rows - header) = 2 + 3 = 5 rows total.
+-	if schema.RowCount != 5 {
+-		t.Fatalf("expected 5 rows total across both sheets, got %d", schema.RowCount)
+-	}
+-
+-	// Columns from both sheets plus __sheet_name must all be present.
+-	colSet := map[string]bool{}
+-	for _, c := range schema.Columns {
+-		colSet[c.Name] = true
+-	}
+-	for _, want := range []string{"id", "amount", "sku", "stock", excelSheetNameColumn} {
+-		if !colSet[want] {
+-			t.Errorf("expected column %q to be present, got columns=%v", want, schema.Columns)
+-		}
+-	}
+-
+-	// Each sheet must contribute its own rows, identifiable via
+-	// __sheet_name.
+-	countPerSheet := map[string]int{}
+-	rows, err := db.QueryContext(ctx,
+-		fmt.Sprintf("SELECT %s, COUNT(*) FROM \"%s\" GROUP BY %s",
+-			excelSheetNameColumn, "t_multi_sheet", excelSheetNameColumn),
+-	)
+-	if err != nil {
+-		t.Fatalf("group-by query: %v", err)
+-	}
+-	defer rows.Close()
+-	for rows.Next() {
+-		var name string
+-		var cnt int
+-		if err := rows.Scan(&name, &cnt); err != nil {
+-			t.Fatalf("scan: %v", err)
+-		}
+-		countPerSheet[name] = cnt
+-	}
+-	if rows.Err() != nil {
+-		t.Fatalf("rows err: %v", rows.Err())
+-	}
+-
+-	if countPerSheet["Sales"] != 2 {
+-		t.Errorf("Sales rows = %d, want 2 (per-sheet breakdown=%v)", countPerSheet["Sales"], countPerSheet)
+-	}
+-	if countPerSheet["Inventory"] != 3 {
+-		t.Errorf("Inventory rows = %d, want 3 (per-sheet breakdown=%v)", countPerSheet["Inventory"], countPerSheet)
+-	}
+-
+-	// Cross-sheet schema drift: a column that exists only in "Sales"
+-	// (amount) must be NULL for rows coming from "Inventory".
+-	var nullCount int
+-	err = db.QueryRowContext(ctx,
+-		fmt.Sprintf("SELECT COUNT(*) FROM \"%s\" WHERE %s = 'Inventory' AND amount IS NULL",
+-			"t_multi_sheet", excelSheetNameColumn),
+-	).Scan(&nullCount)
+-	if err != nil {
+-		t.Fatalf("null-amount query: %v", err)
+-	}
+-	if nullCount != 3 {
+-		t.Errorf("Inventory rows with NULL amount = %d, want 3", nullCount)
+-	}
+-}
+-
+-// TestLoadFromExcel_SingleSheet regression-tests the common single-sheet
+-// case: no multi-sheet UNION wiring should accidentally break it.
+-func TestLoadFromExcel_SingleSheet(t *testing.T) {
+-	db := newTestDuckDB(t)
+-
+-	tmp := t.TempDir()
+-	path := filepath.Join(tmp, "single.xlsx")
+-
+-	writeWorkbook(t, path,
+-		map[string][][]any{
+-			"Data": {
+-				{"name", "value"},
+-				{"alpha", 1},
+-				{"beta", 2},
+-			},
+-		},
+-		[]string{"Data"},
+-	)
+-
+-	tool := &DataAnalysisTool{
+-		BaseTool:  dataAnalysisTool,
+-		db:        db,
+-		sessionID: "test-single-sheet",
+-	}
+-
+-	ctx := context.Background()
+-	schema, err := tool.LoadFromExcel(ctx, path, "t_single")
+-	if err != nil {
+-		t.Fatalf("LoadFromExcel: %v", err)
+-	}
+-	t.Cleanup(func() { tool.Cleanup(ctx) })
+-
+-	if schema.RowCount != 2 {
+-		t.Fatalf("expected 2 data rows, got %d", schema.RowCount)
+-	}
+-
+-	var sheetVal string
+-	if err := db.QueryRowContext(ctx,
+-		fmt.Sprintf("SELECT DISTINCT %s FROM \"%s\"", excelSheetNameColumn, "t_single"),
+-	).Scan(&sheetVal); err != nil {
+-		t.Fatalf("sheet-name query: %v", err)
+-	}
+-	if sheetVal != "Data" {
+-		t.Errorf("expected all rows tagged with sheet 'Data', got %q", sheetVal)
+-	}
+-}
+-
+-// TestLoadFromExcel_QuotedSheetName makes sure sheet names with single
+-// quotes survive the SQL round-trip (guards the quote-escaping path).
+-func TestLoadFromExcel_QuotedSheetName(t *testing.T) {
+-	db := newTestDuckDB(t)
+-
+-	tmp := t.TempDir()
+-	path := filepath.Join(tmp, "quoted.xlsx")
+-
+-	// Excel disallows some characters in sheet names (e.g. []:*?/) but
+-	// single quotes are actually permitted; this is the most likely quote
+-	// bomb for SQL-literal construction.
+-	sheet := "Q1'24"
+-
+-	writeWorkbook(t, path,
+-		map[string][][]any{
+-			sheet: {
+-				{"metric", "value"},
+-				{"revenue", 42},
+-			},
+-		},
+-		[]string{sheet},
+-	)
+-
+-	tool := &DataAnalysisTool{
+-		BaseTool:  dataAnalysisTool,
+-		db:        db,
+-		sessionID: "test-quoted",
+-	}
+-
+-	ctx := context.Background()
+-	schema, err := tool.LoadFromExcel(ctx, path, "t_quoted")
+-	if err != nil {
+-		t.Fatalf("LoadFromExcel: %v", err)
+-	}
+-	t.Cleanup(func() { tool.Cleanup(ctx) })
+-
+-	if schema.RowCount != 1 {
+-		t.Fatalf("expected 1 data row, got %d", schema.RowCount)
+-	}
+-
+-	var got string
+-	if err := db.QueryRowContext(ctx,
+-		fmt.Sprintf("SELECT %s FROM \"%s\" LIMIT 1", excelSheetNameColumn, "t_quoted"),
+-	).Scan(&got); err != nil {
+-		t.Fatalf("sheet-name query: %v", err)
+-	}
+-	if got != sheet {
+-		t.Errorf("sheet-name roundtrip mismatch: got %q, want %q", got, sheet)
+-	}
+-}
+diff --git a/internal/agent/tools/data_analysis_materialize_test.go b/internal/agent/tools/data_analysis_materialize_test.go
+deleted file mode 100644
+index 524f3ed..0000000
+--- a/internal/agent/tools/data_analysis_materialize_test.go
++++ /dev/null
+@@ -1,164 +0,0 @@
+-package tools
+-
+-import (
+-	"bytes"
+-	"context"
+-	"errors"
+-	"io"
+-	"mime/multipart"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"testing"
+-
+-	"github.com/Tencent/WeKnora/internal/types"
+-)
+-
+-// fakeFileService implements interfaces.FileService just enough to drive
+-// materializeKnowledgeFile. Every method we don't care about simply errors
+-// out so accidental usage is loud.
+-type fakeFileService struct {
+-	readers map[string]func() (io.ReadCloser, error)
+-}
+-
+-func (f *fakeFileService) CheckConnectivity(ctx context.Context) error { return nil }
+-func (f *fakeFileService) SaveFile(ctx context.Context, _ *multipart.FileHeader, _ uint64, _ string) (string, error) {
+-	return "", errors.New("not implemented in fake")
+-}
+-func (f *fakeFileService) SaveBytes(ctx context.Context, _ []byte, _ uint64, _ string, _ bool) (string, error) {
+-	return "", errors.New("not implemented in fake")
+-}
+-func (f *fakeFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
+-	fn, ok := f.readers[filePath]
+-	if !ok {
+-		return nil, errors.New("unknown path: " + filePath)
+-	}
+-	return fn()
+-}
+-func (f *fakeFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
+-	// Return a URL that DuckDB would NOT be able to open on its own; the
+-	// production code must *not* pass this through to DuckDB.
+-	return "local://" + strings.TrimPrefix(filePath, "/"), nil
+-}
+-func (f *fakeFileService) DeleteFile(ctx context.Context, _ string) error { return nil }
+-func (f *fakeFileService) CopyFile(ctx context.Context, _ string, _ uint64, _ string) (string, error) {
+-	return "", nil
+-}
+-
+-// TestMaterializeKnowledgeFile_HandlesLocalScheme is the regression guard
+-// for the dev-mode failure where DuckDB was handed a local:// URL it can't
+-// resolve. The tool must pull bytes via FileService.GetFile and hand DuckDB
+-// a concrete filesystem path with the right extension.
+-func TestMaterializeKnowledgeFile_HandlesLocalScheme(t *testing.T) {
+-	payload := []byte("col1,col2\n1,2\n3,4\n")
+-
+-	fs := &fakeFileService{
+-		readers: map[string]func() (io.ReadCloser, error){
+-			"tenants/42/data.csv": func() (io.ReadCloser, error) {
+-				return io.NopCloser(bytes.NewReader(payload)), nil
+-			},
+-		},
+-	}
+-
+-	tool := &DataAnalysisTool{
+-		fileService: fs,
+-		sessionID:   "test-materialize",
+-	}
+-
+-	k := &types.Knowledge{
+-		ID:       "k-abc",
+-		FileType: "csv",
+-		FilePath: "tenants/42/data.csv",
+-	}
+-
+-	path, cleanup, err := tool.materializeKnowledgeFile(context.Background(), k)
+-	if err != nil {
+-		t.Fatalf("materialize: %v", err)
+-	}
+-	t.Cleanup(cleanup)
+-
+-	// Path must be a real filesystem path (no provider scheme) so DuckDB
+-	// can st_read / read_xlsx / read_csv_auto it directly.
+-	if strings.Contains(path, "://") {
+-		t.Fatalf("expected bare filesystem path, got scheme URL: %q", path)
+-	}
+-	if filepath.Ext(path) != ".csv" {
+-		t.Errorf("expected .csv suffix preserved for DuckDB format detection, got %q", path)
+-	}
+-
+-	// File must actually exist and have the exact bytes we fed in.
+-	got, err := os.ReadFile(path)
+-	if err != nil {
+-		t.Fatalf("read temp file: %v", err)
+-	}
+-	if !bytes.Equal(got, payload) {
+-		t.Errorf("payload roundtrip mismatch: got %q, want %q", got, payload)
+-	}
+-
+-	// cleanup() must remove the temp file without error.
+-	cleanup()
+-	if _, err := os.Stat(path); !os.IsNotExist(err) {
+-		t.Errorf("expected temp file to be removed after cleanup, stat err=%v", err)
+-	}
+-	// Double-cleanup must be safe (test harness may invoke it again).
+-	cleanup()
+-}
+-
+-func TestMaterializeKnowledgeFile_PropagatesGetFileError(t *testing.T) {
+-	fs := &fakeFileService{
+-		readers: map[string]func() (io.ReadCloser, error){
+-			"bad/path": func() (io.ReadCloser, error) {
+-				return nil, errors.New("boom")
+-			},
+-		},
+-	}
+-
+-	tool := &DataAnalysisTool{fileService: fs, sessionID: "test-error"}
+-
+-	_, cleanup, err := tool.materializeKnowledgeFile(
+-		context.Background(),
+-		&types.Knowledge{ID: "k-err", FileType: "xlsx", FilePath: "bad/path"},
+-	)
+-	if err == nil {
+-		defer cleanup()
+-		t.Fatal("expected error from underlying GetFile, got nil")
+-	}
+-	if !strings.Contains(err.Error(), "boom") {
+-		t.Errorf("expected wrapped 'boom' error, got: %v", err)
+-	}
+-}
+-
+-func TestMaterializeKnowledgeFile_PreservesExtension(t *testing.T) {
+-	cases := []struct {
+-		fileType string
+-		wantExt  string
+-	}{
+-		{"xlsx", ".xlsx"},
+-		{"XLSX", ".xlsx"}, // normalized lowercase
+-		{"csv", ".csv"},
+-		{"xls", ".xls"},
+-	}
+-	for _, c := range cases {
+-		t.Run(c.fileType, func(t *testing.T) {
+-			fs := &fakeFileService{
+-				readers: map[string]func() (io.ReadCloser, error){
+-					"p": func() (io.ReadCloser, error) {
+-						return io.NopCloser(bytes.NewReader([]byte("x"))), nil
+-					},
+-				},
+-			}
+-			tool := &DataAnalysisTool{fileService: fs, sessionID: "ext"}
+-			path, cleanup, err := tool.materializeKnowledgeFile(
+-				context.Background(),
+-				&types.Knowledge{ID: "k", FileType: c.fileType, FilePath: "p"},
+-			)
+-			if err != nil {
+-				t.Fatalf("materialize: %v", err)
+-			}
+-			defer cleanup()
+-			if filepath.Ext(path) != c.wantExt {
+-				t.Errorf("fileType=%q: extension mismatch got %q want %q", c.fileType, filepath.Ext(path), c.wantExt)
+-			}
+-		})
+-	}
+-}
+diff --git a/internal/agent/tools/data_analysis_test.go b/internal/agent/tools/data_analysis_test.go
+deleted file mode 100644
+index a809c74..0000000
+--- a/internal/agent/tools/data_analysis_test.go
++++ /dev/null
+@@ -1,90 +0,0 @@
+-package tools
+-
+-import (
+-	"strings"
+-	"testing"
+-)
+-
+-func TestBuildExcelCreateTableSQL_NoSheets(t *testing.T) {
+-	got := buildExcelCreateTableSQL("tbl", "/tmp/data.xlsx", nil)
+-	want := `CREATE TABLE "tbl" AS SELECT * FROM read_xlsx('/tmp/data.xlsx', header=true, all_varchar=true)`
+-	if got != want {
+-		t.Fatalf("mismatch.\n got: %s\nwant: %s", got, want)
+-	}
+-}
+-
+-func TestBuildExcelCreateTableSQL_SingleSheetTagsSource(t *testing.T) {
+-	got := buildExcelCreateTableSQL("tbl", "/tmp/data.xlsx", []string{"Sheet1"})
+-
+-	// Must use read_xlsx (excel extension) with explicit sheet param.
+-	if !strings.Contains(got, "FROM read_xlsx('/tmp/data.xlsx', sheet = 'Sheet1', header=true, all_varchar=true)") {
+-		t.Fatalf("expected read_xlsx with sheet param, got: %s", got)
+-	}
+-	// Must tag the source sheet name via the synthetic column so downstream
+-	// SQL behaves consistently between single- and multi-sheet workbooks.
+-	if !strings.Contains(got, "'Sheet1' AS "+excelSheetNameColumn) {
+-		t.Fatalf("expected sheet-name column, got: %s", got)
+-	}
+-}
+-
+-func TestBuildExcelCreateTableSQL_MultiSheetUsesUnionAllByName(t *testing.T) {
+-	got := buildExcelCreateTableSQL("tbl", "/tmp/data.xlsx", []string{"Sheet1", "Sheet2", "报表"})
+-
+-	// Each sheet must appear as a SELECT reading that specific sheet, and
+-	// the __sheet_name column must carry its name for per-sheet filtering.
+-	for _, sheet := range []string{"Sheet1", "Sheet2", "报表"} {
+-		needleRead := "FROM read_xlsx('/tmp/data.xlsx', sheet = '" + sheet + "', header=true, all_varchar=true)"
+-		needleTag := "'" + sheet + "' AS " + excelSheetNameColumn
+-		if !strings.Contains(got, needleRead) {
+-			t.Fatalf("missing read_xlsx for sheet %q in:\n%s", sheet, got)
+-		}
+-		if !strings.Contains(got, needleTag) {
+-			t.Fatalf("missing __sheet_name tag for sheet %q in:\n%s", sheet, got)
+-		}
+-	}
+-
+-	// Must combine with UNION ALL BY NAME so schema drift between sheets is
+-	// tolerated.
+-	if !strings.Contains(got, "UNION ALL BY NAME") {
+-		t.Fatalf("expected UNION ALL BY NAME in multi-sheet SQL, got:\n%s", got)
+-	}
+-
+-	// Exactly N-1 UNIONs for N sheets.
+-	if strings.Count(got, "UNION ALL BY NAME") != 2 {
+-		t.Fatalf("expected 2 UNION ALL BY NAME separators, got %d in:\n%s",
+-			strings.Count(got, "UNION ALL BY NAME"), got)
+-	}
+-}
+-
+-func TestBuildExcelCreateTableSQL_EscapesSingleQuotes(t *testing.T) {
+-	// Sheet name and file path both contain single quotes, which must be
+-	// doubled to produce a valid SQL literal.
+-	sheets := []string{"Jo's data"}
+-	got := buildExcelCreateTableSQL("tbl", "/tmp/O'Brien/data.xlsx", sheets)
+-
+-	if !strings.Contains(got, "sheet = 'Jo''s data'") {
+-		t.Fatalf("sheet name was not escaped, got:\n%s", got)
+-	}
+-	if !strings.Contains(got, "read_xlsx('/tmp/O''Brien/data.xlsx'") {
+-		t.Fatalf("file path was not escaped, got:\n%s", got)
+-	}
+-	if !strings.Contains(got, "'Jo''s data' AS "+excelSheetNameColumn) {
+-		t.Fatalf("sheet-name literal was not escaped, got:\n%s", got)
+-	}
+-}
+-
+-func TestSqlSingleQuoteEscape(t *testing.T) {
+-	cases := map[string]string{
+-		"":               "",
+-		"no_quote":       "no_quote",
+-		"a'b":            "a''b",
+-		"''":             "''''",
+-		"mix'ed'quote":   "mix''ed''quote",
+-		"中文 with 'quote": "中文 with ''quote",
+-	}
+-	for in, want := range cases {
+-		if got := sqlSingleQuoteEscape(in); got != want {
+-			t.Errorf("sqlSingleQuoteEscape(%q) = %q, want %q", in, got, want)
+-		}
+-	}
+-}
+diff --git a/internal/agent/tools/data_schema.go b/internal/agent/tools/data_schema.go
+deleted file mode 100644
+index 605469c..0000000
+--- a/internal/agent/tools/data_schema.go
++++ /dev/null
+@@ -1,136 +0,0 @@
+-package tools
+-
+-import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+-
+-	"github.com/Tencent/WeKnora/internal/types"
+-	"github.com/Tencent/WeKnora/internal/types/interfaces"
+-	"github.com/Tencent/WeKnora/internal/utils"
+-)
+-
+-var dataSchemaTool = BaseTool{
+-	name:        ToolDataSchema,
+-	description: "Use this tool to get the schema information of a CSV or Excel file loaded into DuckDB. It returns the table name, columns, and row count.",
+-	schema:      utils.GenerateSchema[DataSchemaInput](),
+-}
+-
+-type DataSchemaInput struct {
+-	KnowledgeID string `json:"knowledge_id" jsonschema:"short dN document ID to query"`
+-}
+-
+-type DataSchemaTool struct {
+-	BaseTool
+-	knowledgeService interfaces.KnowledgeService
+-	chunkRepo        interfaces.ChunkRepository
+-	targetChunkTypes []types.ChunkType
+-	searchTargets    types.SearchTargets
+-	scopeEnforced    bool
+-}
+-
+-// WithSearchTargets enables Agent request-scope authorization. An Agent turn
+-// with no search target must reject every document rather than fall back to
+-// the unrestricted service-owned lookup.
+-func (t *DataSchemaTool) WithSearchTargets(searchTargets types.SearchTargets) *DataSchemaTool {
+-	t.searchTargets = searchTargets
+-	t.scopeEnforced = true
+-	return t
+-}
+-
+-func NewDataSchemaTool(knowledgeService interfaces.KnowledgeService, chunkRepo interfaces.ChunkRepository, targetChunkTypes ...types.ChunkType) *DataSchemaTool {
+-	if len(targetChunkTypes) == 0 {
+-		targetChunkTypes = []types.ChunkType{types.ChunkTypeTableSummary, types.ChunkTypeTableColumn}
+-	}
+-	return &DataSchemaTool{
+-		BaseTool:         dataSchemaTool,
+-		knowledgeService: knowledgeService,
+-		chunkRepo:        chunkRepo,
+-		targetChunkTypes: targetChunkTypes,
+-	}
+-}
+-
+-// Execute executes the tool logic
+-func (t *DataSchemaTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
+-	var input DataSchemaInput
+-	if err := json.Unmarshal(args, &input); err != nil {
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Failed to parse input args: %v", err),
+-		}, err
+-	}
+-
+-	// Get knowledge to get TenantID (use IDOnly to support cross-tenant shared KB)
+-	var knowledge *types.Knowledge
+-	var err error
+-	if t.scopeEnforced {
+-		knowledge, err = authorizeKnowledgeInSearchTargets(ctx, t.searchTargets, input.KnowledgeID, t.knowledgeService)
+-	} else {
+-		knowledge, err = t.knowledgeService.GetKnowledgeByIDOnly(ctx, input.KnowledgeID)
+-	}
+-	if err != nil || knowledge == nil {
+-		if err == nil {
+-			err = fmt.Errorf("knowledge service returned an empty result")
+-		}
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Failed to get knowledge '%s': %v", input.KnowledgeID, err),
+-		}, err
+-	}
+-
+-	// Get chunks for the knowledge ID using ChunkRepository
+-	// We only need table summary and column chunks
+-	chunkTypes := t.targetChunkTypes
+-	page := &types.Pagination{
+-		Page:     1,
+-		PageSize: 100, // Should be enough for schema chunks
+-	}
+-	enabled := true
+-
+-	chunks, _, err := t.chunkRepo.ListPagedChunksByKnowledgeID(
+-		ctx,
+-		knowledge.TenantID,
+-		input.KnowledgeID,
+-		page,
+-		chunkTypes,
+-		nil, // tagIDs
+-		"",  // keyword
+-		"",  // searchField
+-		"",  // sortOrder
+-		"",  // knowledgeType
+-		&enabled,
+-	)
+-	if err != nil {
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("Failed to list chunks for knowledge ID '%s': %v", input.KnowledgeID, err),
+-		}, err
+-	}
+-
+-	var summaryContent, columnContent string
+-	for _, chunk := range chunks {
+-		if chunk.ChunkType == types.ChunkTypeTableSummary {
+-			summaryContent = chunk.Content
+-		} else if chunk.ChunkType == types.ChunkTypeTableColumn {
+-			columnContent = chunk.Content
+-		}
+-	}
+-
+-	if summaryContent == "" || columnContent == "" {
+-		return &types.ToolResult{
+-			Success: false,
+-			Error:   fmt.Sprintf("No table schema information found for knowledge ID '%s'", input.KnowledgeID),
+-		}, fmt.Errorf("no schema info found")
+-	}
+-
+-	output := fmt.Sprintf("%s\n\n%s", summaryContent, columnContent)
+-
+-	return &types.ToolResult{
+-		Success: true,
+-		Output:  output,
+-		Data: map[string]interface{}{
+-			"summary": summaryContent,
+-			"columns": columnContent,
+-		},
+-	}, nil
+-}
+diff --git a/internal/agent/tools/definitions.go b/internal/agent/tools/definitions.go
+index 451a3e0..079bbaf 100644
+--- a/internal/agent/tools/definitions.go
++++ b/internal/agent/tools/definitions.go
+@@ -16,8 +16,6 @@ const (
+ 	ToolSearchConversations = "search_conversations"
+ 	ToolSearchMemory        = "search_memory"
+ 	ToolDatabaseQuery       = "database_query"
+-	ToolDataAnalysis        = "data_analysis"
+-	ToolDataSchema          = "data_schema"
+ 	ToolWebSearch           = "web_search"
+ 	ToolWebFetch            = "web_fetch"
+ 	// Skills-related tools (only available when skills are enabled).
+@@ -100,8 +98,6 @@ func AvailableToolDefinitions() []AvailableTool {
+ 			Description: "在用户自己的历史会话中查找之前聊过的内容",
+ 		},
+ 		{Name: ToolDatabaseQuery, Label: "查询数据库", Description: "查询数据库中的信息"},
+-		{Name: ToolDataAnalysis, Label: "数据分析", Description: "理解数据文件并进行数据分析"},
+-		{Name: ToolDataSchema, Label: "查看数据元信息", Description: "获取表格文件的元信息"},
+ 		{Name: ToolWikiReadPage, Label: "读取Wiki页面", Description: "读取指定的Wiki页面内容"},
+ 		{Name: ToolWikiSearch, Label: "搜索Wiki", Description: "在Wiki中搜索页面"},
+ 		{Name: ToolWikiReadSourceDoc, Label: "精读源文档", Description: "使用知识点深入阅读特定原始文档"},
+@@ -136,7 +132,5 @@ func DefaultAllowedTools() []string {
+ 		// not. Adding it here would let a stale allowlist decide something the
+ 		// memory switches already decide.
+ 		ToolDatabaseQuery,
+-		ToolDataAnalysis,
+-		ToolDataSchema,
+ 	}
+ }
+diff --git a/internal/agent/tools/tool_policy_coverage_test.go b/internal/agent/tools/tool_policy_coverage_test.go
+index f4a6932..c1bd1ae 100644
+--- a/internal/agent/tools/tool_policy_coverage_test.go
++++ b/internal/agent/tools/tool_policy_coverage_test.go
+@@ -24,8 +24,6 @@ func TestEveryBuiltInToolDeclaresAModelHandlePolicy(t *testing.T) {
+ 		ToolSearchConversations,
+ 		ToolSearchMemory,
+ 		ToolDatabaseQuery,
+-		ToolDataAnalysis,
+-		ToolDataSchema,
+ 		ToolWebSearch,
+ 		ToolWebFetch,
+ 		ToolExecuteSkillScript,
+diff --git a/internal/application/service/agent_service.go b/internal/application/service/agent_service.go
+index 13a6095..e3423b3 100644
+--- a/internal/application/service/agent_service.go
++++ b/internal/application/service/agent_service.go
+@@ -2,7 +2,6 @@ package service
+ 
+ import (
+ 	"context"
+-	"database/sql"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -103,7 +102,6 @@ type agentService struct {
+ 	knowledgeService      interfaces.KnowledgeService
+ 	fileService           interfaces.FileService
+ 	chunkService          interfaces.ChunkService
+-	duckdb                *sql.DB
+ 	webSearchStateService interfaces.WebSearchStateService
+ 	wikiPageService       interfaces.WikiPageService
+ 	tenantService         interfaces.TenantService
+@@ -130,7 +128,6 @@ func NewAgentService(
+ 	eventBus *event.EventBus,
+ 	db *gorm.DB,
+ 	webSearchService interfaces.WebSearchService,
+-	duckdb *sql.DB,
+ 	webSearchStateService interfaces.WebSearchStateService,
+ 	wikiPageService interfaces.WikiPageService,
+ 	tenantService interfaces.TenantService,
+@@ -155,7 +152,6 @@ func NewAgentService(
+ 		eventBus:              eventBus,
+ 		db:                    db,
+ 		webSearchService:      webSearchService,
+-		duckdb:                duckdb,
+ 		webSearchStateService: webSearchStateService,
+ 		wikiPageService:       wikiPageService,
+ 		tenantService:         tenantService,
+@@ -885,8 +881,6 @@ func (s *agentService) registerTools(
+ 			tools.ToolQueryKnowledgeGraph: true,
+ 			tools.ToolGetDocumentInfo:     true,
+ 			tools.ToolDatabaseQuery:       true,
+-			tools.ToolDataAnalysis:        true,
+-			tools.ToolDataSchema:          true,
+ 			// Wiki tools also require at least one KB in scope.
+ 			tools.ToolWikiReadPage:      true,
+ 			tools.ToolWikiSearch:        true,
+@@ -1060,16 +1054,6 @@ func (s *agentService) registerTools(
+ 			toolToRegister = tools.NewWebFetchTool(chatModel)
+ 			logger.Infof(ctx, "Registered web_fetch tool for session: %s", sessionID)
+ 
+-		case tools.ToolDataAnalysis:
+-			toolToRegister = tools.NewDataAnalysisTool(s.knowledgeBaseService, s.knowledgeService, s.tenantService, s.fileService, s.duckdb, sessionID, s.storageResolver).
+-				WithSearchTargets(config.SearchTargets)
+-			logger.Infof(ctx, "Registered data_analysis tool for session: %s", sessionID)
+-
+-		case tools.ToolDataSchema:
+-			toolToRegister = tools.NewDataSchemaTool(s.knowledgeService, s.chunkService.GetRepository()).
+-				WithSearchTargets(config.SearchTargets)
+-			logger.Infof(ctx, "Registered data_schema tool")
+-
+ 		// Wiki tools — only registered when wiki KBs are detected
+ 		case tools.ToolWikiReadPage:
+ 			toolToRegister = tools.NewWikiReadPageTool(s.wikiPageService, s.knowledgeService, wikiScopes, wikiRoutes)
+diff --git a/internal/application/service/chat_pipeline/data_analysis.go b/internal/application/service/chat_pipeline/data_analysis.go
+deleted file mode 100644
+index 38c4071..0000000
+--- a/internal/application/service/chat_pipeline/data_analysis.go
++++ /dev/null
+@@ -1,177 +0,0 @@
+-package chatpipeline
+-
+-import (
+-	"context"
+-	"database/sql"
+-	"encoding/json"
+-	"fmt"
+-	"slices"
+-	"strings"
+-
+-	"github.com/Tencent/WeKnora/internal/agent/tools"
+-	"github.com/Tencent/WeKnora/internal/logger"
+-	"github.com/Tencent/WeKnora/internal/models/chat"
+-	"github.com/Tencent/WeKnora/internal/types"
+-	"github.com/Tencent/WeKnora/internal/types/interfaces"
+-	"github.com/Tencent/WeKnora/internal/utils"
+-)
+-
+-type PluginDataAnalysis struct {
+-	modelService         interfaces.ModelService
+-	knowledgeBaseService interfaces.KnowledgeBaseService
+-	knowledgeService     interfaces.KnowledgeService
+-	fileService          interfaces.FileService
+-	chunkRepo            interfaces.ChunkRepository
+-	tenantService        interfaces.TenantService
+-	db                   *sql.DB
+-}
+-
+-func NewPluginDataAnalysis(
+-	eventManager *EventManager,
+-	modelService interfaces.ModelService,
+-	knowledgeBaseService interfaces.KnowledgeBaseService,
+-	knowledgeService interfaces.KnowledgeService,
+-	fileService interfaces.FileService,
+-	chunkRepo interfaces.ChunkRepository,
+-	tenantService interfaces.TenantService,
+-	db *sql.DB,
+-) *PluginDataAnalysis {
+-	p := &PluginDataAnalysis{
+-		modelService:         modelService,
+-		knowledgeBaseService: knowledgeBaseService,
+-		knowledgeService:     knowledgeService,
+-		fileService:          fileService,
+-		chunkRepo:            chunkRepo,
+-		tenantService:        tenantService,
+-		db:                   db,
+-	}
+-	eventManager.Register(p)
+-	return p
+-}
+-
+-func (p *PluginDataAnalysis) ActivationEvents() []types.EventType {
+-	return []types.EventType{types.DATA_ANALYSIS}
+-}
+-
+-func (p *PluginDataAnalysis) OnEvent(
+-	ctx context.Context,
+-	eventType types.EventType,
+-	chatManage *types.ChatManage,
+-	next func() *PluginError,
+-) *PluginError {
+-	if !chatManage.NeedsRetrieval() {
+-		return next()
+-	}
+-	// 1. Check if there are any CSV/Excel files in MergeResult
+-	var dataFiles []*types.SearchResult
+-	for _, result := range chatManage.MergeResult {
+-		if isDataFile(result.KnowledgeFilename) {
+-			dataFiles = append(dataFiles, result)
+-		}
+-	}
+-
+-	// Filter out table column and table summary chunks from MergeResult
+-	chatManage.MergeResult = filterOutTableChunks(chatManage.MergeResult)
+-
+-	if len(dataFiles) == 0 {
+-		return next()
+-	}
+-
+-	// 2. Ask LLM if data analysis is needed
+-	// We only process the first data file for now to avoid complexity
+-	targetFile := dataFiles[0]
+-
+-	// Get Knowledge details to get file path
+-	knowledge, err := p.knowledgeService.GetKnowledgeByID(ctx, targetFile.KnowledgeID)
+-	if err != nil {
+-		logger.Errorf(ctx, "Failed to get knowledge %s: %v", targetFile.KnowledgeID, err)
+-		return next()
+-	}
+-
+-	// Initialize DataAnalysisTool
+-	tool := tools.NewDataAnalysisTool(p.knowledgeBaseService, p.knowledgeService, p.tenantService, p.fileService, p.db, chatManage.SessionID)
+-	defer tool.Cleanup(ctx)
+-
+-	// Load data into DuckDB
+-	schema, err := tool.LoadFromKnowledge(ctx, knowledge)
+-	if err != nil {
+-		logger.Errorf(ctx, "Failed to get data schema: %v", err)
+-		return next()
+-	}
+-
+-	// Ask LLM to generate SQL for data analysis
+-	chatModel, err := p.modelService.GetChatModel(ctx, chatManage.ChatModelID)
+-	if err != nil {
+-		return ErrGetChatModel.WithError(err)
+-	}
+-
+-	// Use utils.GenerateSchema to generate format schema for DataAnalysisInput
+-	formatSchema := utils.GenerateSchema[tools.DataAnalysisInput]()
+-
+-	analysisPrompt := fmt.Sprintf(`
+-User Question: %s
+-Knowledge ID: %s
+-Table Schema: %s
+-
+-Determine if the user's question requires data analysis (e.g., statistics, aggregation, filtering) on this table.
+-If YES, generate a DuckDB SQL query to answer the user's question and fill in the knowledge_id and sql fields.
+-If NO, leave the sql field empty.
+-
+-Return your response in the specified JSON format.`, chatManage.Query, knowledge.ID, schema.Description())
+-
+-	modelCtx := types.WithLLMCallMetadata(ctx, "data_analysis_plan", "")
+-	response, err := chatModel.Chat(modelCtx, []chat.Message{
+-		{Role: "user", Content: analysisPrompt},
+-	}, &chat.ChatOptions{
+-		Temperature: 0.1,
+-		Format:      formatSchema,
+-	})
+-	if err != nil {
+-		logger.Errorf(ctx, "Failed to generate analysis response: %v", err)
+-		return next()
+-	}
+-	// logger.Debugf(ctx, "Data analysis LLM response: %s", response.Content)
+-
+-	// Execute SQL using the tool
+-	// Initialize DataAnalysisTool
+-	toolResult, err := tool.Execute(ctx, json.RawMessage(response.Content))
+-	if err != nil {
+-		logger.Errorf(ctx, "Failed to execute SQL: %v", err)
+-		return next()
+-	}
+-
+-	// 5. Store result
+-	// Create a new SearchResult for the analysis output
+-	analysisResult := &types.SearchResult{
+-		ID:                   "analysis_" + knowledge.ID,
+-		Content:              toolResult.Output,
+-		Score:                1.0,
+-		MatchType:            types.MatchTypeDataAnalysis,
+-		KnowledgeID:          knowledge.ID,
+-		KnowledgeTitle:       knowledge.Title,
+-		KnowledgeFilename:    knowledge.FileName,
+-		KnowledgeDescription: knowledge.Description,
+-	}
+-
+-	chatManage.MergeResult = append(chatManage.MergeResult, analysisResult)
+-
+-	return next()
+-}
+-
+-func isDataFile(filename string) bool {
+-	lower := strings.ToLower(filename)
+-	return strings.HasSuffix(lower, ".csv") || strings.HasSuffix(lower, ".xlsx") || strings.HasSuffix(lower, ".xls")
+-}
+-
+-// filterOutTableChunks filters out table column and table summary chunks from search results
+-func filterOutTableChunks(results []*types.SearchResult) []*types.SearchResult {
+-	filtered := make([]*types.SearchResult, 0, len(results))
+-	filterList := []string{string(types.ChunkTypeTableColumn), string(types.ChunkTypeTableSummary)}
+-	for _, result := range results {
+-		if slices.Contains(filterList, result.ChunkType) {
+-			continue
+-		}
+-		filtered = append(filtered, result)
+-	}
+-	return filtered
+-}
+diff --git a/internal/application/service/extract.go b/internal/application/service/extract.go
+index 3d789d6..dc0a158 100644
+--- a/internal/application/service/extract.go
++++ b/internal/application/service/extract.go
+@@ -2,20 +2,15 @@ package service
+ 
+ import (
+ 	"context"
+-	"database/sql"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/Tencent/WeKnora/internal/agent/tools"
+ 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
+-	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+ 	"github.com/Tencent/WeKnora/internal/config"
+ 	"github.com/Tencent/WeKnora/internal/logger"
+-	"github.com/Tencent/WeKnora/internal/models/chat"
+-	"github.com/Tencent/WeKnora/internal/models/embedding"
+ 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
+ 	"github.com/Tencent/WeKnora/internal/types"
+ 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+@@ -124,59 +119,6 @@ func NewChunkExtractTask(
+ 	return true, nil
+ }
+ 
+-// NewTableExtractTask creates a new table extract task
+-func NewDataTableSummaryTask(
+-	ctx context.Context,
+-	client interfaces.TaskEnqueuer,
+-	tenantID uint64,
+-	knowledgeID string,
+-	summaryModel string,
+-	embeddingModel string,
+-) error {
+-	taskPayload := DataTableSummaryPayload{
+-		TenantID:       tenantID,
+-		KnowledgeID:    knowledgeID,
+-		SummaryModel:   summaryModel,
+-		EmbeddingModel: embeddingModel,
+-	}
+-	langfuse.InjectTracing(ctx, &taskPayload)
+-	payload, err := json.Marshal(taskPayload)
+-	if err != nil {
+-		return err
+-	}
+-	task := asynq.NewTask(types.TypeDataTableSummary, payload,
+-		asynq.Queue(types.QueueSummary), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
+-	info, err := client.Enqueue(task)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to enqueue data table summary task: %v", err)
+-		return fmt.Errorf("failed to enqueue data table summary task: %v", err)
+-	}
+-	logger.Infof(ctx, "enqueued data table summary task: id=%s queue=%s knowledge=%s",
+-		info.ID, info.Queue, knowledgeID)
+-	return nil
+-}
+-
+-// enqueueDataTableSummaryIfNeeded enqueues table summary work for spreadsheet
+-// imports. fileName is a fallback for older records whose FileType is empty.
+-func enqueueDataTableSummaryIfNeeded(
+-	ctx context.Context,
+-	client interfaces.TaskEnqueuer,
+-	tenantID uint64,
+-	knowledgeID string,
+-	fileName, fileType, summaryModelID, embeddingModelID string,
+-) {
+-	ft := normalizeFileExtension(fileType)
+-	if ft == "" && fileName != "" {
+-		ft = getFileType(fileName)
+-	}
+-	if !isDataTableFileType(ft) {
+-		return
+-	}
+-	if err := NewDataTableSummaryTask(ctx, client, tenantID, knowledgeID, summaryModelID, embeddingModelID); err != nil {
+-		logger.Warnf(ctx, "Failed to enqueue data table summary task for knowledge %s: %v", knowledgeID, err)
+-	}
+-}
+-
+ // ChunkExtractService is a service for extracting chunks
+ type ChunkExtractService struct {
+ 	template          *types.PromptTemplateStructured
+@@ -405,505 +347,3 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
+ 	}
+ 	return nil
+ }
+-
+-// DataTableExtractPayload represents the table extract task payload
+-type DataTableSummaryPayload struct {
+-	types.TracingContext
+-	TenantID       uint64 `json:"tenant_id"`
+-	KnowledgeID    string `json:"knowledge_id"`
+-	SummaryModel   string `json:"summary_model"`
+-	EmbeddingModel string `json:"embedding_model"`
+-}
+-
+-// DataTableSummaryService is a service for extracting tables
+-type DataTableSummaryService struct {
+-	modelService         interfaces.ModelService
+-	knowledgeBaseService interfaces.KnowledgeBaseService
+-	knowledgeService     interfaces.KnowledgeService
+-	fileService          interfaces.FileService
+-	chunkService         interfaces.ChunkService
+-	tenantService        interfaces.TenantService
+-	retrieveEngine       interfaces.RetrieveEngineRegistry
+-	ownership            retriever.TenantStoreOwnership
+-	sqlDB                *sql.DB
+-	storageResolver      interfaces.StorageBackendResolver
+-}
+-
+-// NewDataTableSummaryService creates a new DataTableSummaryService
+-func NewDataTableSummaryService(
+-	modelService interfaces.ModelService,
+-	knowledgeBaseService interfaces.KnowledgeBaseService,
+-	knowledgeService interfaces.KnowledgeService,
+-	fileService interfaces.FileService,
+-	chunkService interfaces.ChunkService,
+-	tenantService interfaces.TenantService,
+-	retrieveEngine interfaces.RetrieveEngineRegistry,
+-	ownership retriever.TenantStoreOwnership,
+-	sqlDB *sql.DB,
+-	storageResolver interfaces.StorageBackendResolver,
+-) interfaces.TaskHandler {
+-	return &DataTableSummaryService{
+-		modelService:         modelService,
+-		knowledgeBaseService: knowledgeBaseService,
+-		knowledgeService:     knowledgeService,
+-		fileService:          fileService,
+-		chunkService:         chunkService,
+-		tenantService:        tenantService,
+-		retrieveEngine:       retrieveEngine,
+-		ownership:            ownership,
+-		sqlDB:                sqlDB,
+-		storageResolver:      storageResolver,
+-	}
+-}
+-
+-// Handle implements the TaskHandler interface for table extraction
+-// 整体流程：初始化 -> 准备资源 -> 加载数据 -> 生成摘要 -> 创建索引
+-func (s *DataTableSummaryService) Handle(ctx context.Context, t *asynq.Task) error {
+-	// 1. 解析任务并初始化上下文
+-	var payload DataTableSummaryPayload
+-	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+-		logger.Errorf(ctx, "failed to unmarshal table extract task payload: %v", err)
+-		return err
+-	}
+-
+-	ctx = logger.WithRequestID(ctx, uuid.New().String())
+-	ctx = logger.WithField(ctx, "knowledge", payload.KnowledgeID)
+-	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
+-
+-	logger.Infof(ctx, "Processing table extraction for knowledge: %s", payload.KnowledgeID)
+-
+-	// 2. 准备所有必需的资源（知识、模型、引擎等）
+-	resources, err := s.prepareResources(ctx, payload)
+-	if err != nil {
+-		return err
+-	}
+-
+-	// 3. 加载表格数据并生成摘要
+-	chunks, err := s.processTableData(ctx, resources)
+-	if err != nil {
+-		return err
+-	}
+-
+-	// 4. 索引到向量数据库
+-	if err := s.indexToVectorDB(ctx, chunks, resources.retrieveEngine, resources.embeddingModel); err != nil {
+-		s.cleanupOnFailure(ctx, resources, chunks, err)
+-		return err
+-	}
+-
+-	logger.Infof(ctx, "Table extraction completed for knowledge: %s", payload.KnowledgeID)
+-	return nil
+-}
+-
+-// extractionResources 封装提取过程所需的所有资源
+-type extractionResources struct {
+-	knowledge      *types.Knowledge
+-	knowledgeBase  *types.KnowledgeBase
+-	tenant         *types.Tenant
+-	chatModel      chat.Chat
+-	embeddingModel embedding.Embedder
+-	retrieveEngine *retriever.CompositeRetrieveEngine
+-}
+-
+-// prepareResources 准备提取所需的所有资源
+-// 思路：集中加载所有依赖，统一错误处理，避免分散的资源获取逻辑
+-func (s *DataTableSummaryService) prepareResources(ctx context.Context, payload DataTableSummaryPayload) (*extractionResources, error) {
+-	// 获取并验证知识文件
+-	knowledge, err := s.knowledgeService.GetKnowledgeByID(ctx, payload.KnowledgeID)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get knowledge: %v", err)
+-		return nil, err
+-	}
+-
+-	// 验证文件类型
+-	fileType := strings.ToLower(knowledge.FileType)
+-	if fileType != "csv" && fileType != "xlsx" && fileType != "xls" {
+-		logger.Warnf(ctx, "knowledge %s is not a CSV or Excel file, skipping table summary", payload.KnowledgeID)
+-		return nil, fmt.Errorf("unsupported file type: %s", fileType)
+-	}
+-
+-	// 获取空间信息
+-	tenantInfo, err := s.tenantService.GetTenantByID(ctx, payload.TenantID)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get tenant: %v", err)
+-		return nil, err
+-	}
+-
+-	// 获取聊天模型（用于生成摘要）
+-	chatModel, err := s.modelService.GetChatModel(ctx, payload.SummaryModel)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get chat model: %v", err)
+-		return nil, err
+-	}
+-
+-	// 获取嵌入模型（用于向量化）
+-	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, payload.EmbeddingModel)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get embedding model: %v", err)
+-		return nil, err
+-	}
+-
+-	// Load the KB to discover its VectorStoreID binding so the factory can
+-	// route to the bound store (or fall back to tenant engines if unbound).
+-	kb, err := s.knowledgeBaseService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get knowledge base for vector store lookup: %v", err)
+-		return nil, err
+-	}
+-	var vectorStoreID *string
+-	if kb != nil {
+-		vectorStoreID = kb.VectorStoreID
+-	}
+-
+-	// The factory's unbound path reads TenantInfo from ctx.
+-	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
+-
+-	// Resolve the engine via the factory using the KB's VectorStore binding
+-	// (nil -> tenant effective engines fallback; verified tenant ownership otherwise).
+-	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
+-		ctx, s.retrieveEngine, s.ownership, payload.TenantID, vectorStoreID)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get retrieve engine: %v", err)
+-		return nil, err
+-	}
+-
+-	return &extractionResources{
+-		knowledge:      knowledge,
+-		knowledgeBase:  kb,
+-		tenant:         tenantInfo,
+-		chatModel:      chatModel,
+-		embeddingModel: embeddingModel,
+-		retrieveEngine: retrieveEngine,
+-	}, nil
+-}
+-
+-// resolveFileServiceForKnowledge resolves a provider-specific file service for the current knowledge file.
+-// It falls back to the global service when tenant storage config is unavailable.
+-func (s *DataTableSummaryService) resolveFileServiceForKnowledge(ctx context.Context, resources *extractionResources) interfaces.FileService {
+-	if resources == nil || resources.knowledge == nil {
+-		return s.fileService
+-	}
+-	if resources.tenant == nil {
+-		return s.fileService
+-	}
+-
+-	provider := types.InferStorageFromFilePath(resources.knowledge.FilePath)
+-	if provider == "" && resources.tenant.StorageEngineConfig != nil {
+-		provider = strings.ToLower(strings.TrimSpace(resources.tenant.StorageEngineConfig.DefaultProvider))
+-	}
+-
+-	baseDir := strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR"))
+-	backendID, _, _ := types.ParseStorageBackendPath(resources.knowledge.FilePath)
+-	if backendID == "" && resources.knowledgeBase != nil && resources.knowledgeBase.StorageBackendID != nil {
+-		backendID = strings.TrimSpace(*resources.knowledgeBase.StorageBackendID)
+-	}
+-
+-	// New-model workspaces resolve via DefaultStorageBackendID even when no
+-	// legacy StorageEngineConfig / provider is present, so gate on the resolver
+-	// and a usable backendID/provider rather than requiring a non-empty provider.
+-	if s.storageResolver == nil || (backendID == "" && provider == "") {
+-		return s.fileService
+-	}
+-
+-	resolvedSvc, resolvedProvider, err := s.storageResolver.ResolveFileService(ctx, resources.tenant, backendID, provider, baseDir)
+-	if err != nil {
+-		logger.Warnf(ctx, "[TableSummary] Failed to resolve file service for provider=%s, fallback to default: %v", provider, err)
+-		return s.fileService
+-	}
+-	logger.Infof(ctx, "[TableSummary] Resolved file service for knowledge=%s provider=%s", resources.knowledge.ID, resolvedProvider)
+-	return resolvedSvc
+-}
+-
+-// processTableData 处理表格数据：加载 -> 分析 -> 生成摘要 -> 创建chunks
+-// 思路：将数据处理的核心流程集中在一起，保持逻辑连贯性
+-func (s *DataTableSummaryService) processTableData(ctx context.Context, resources *extractionResources) ([]*types.Chunk, error) {
+-	// 创建DuckDB会话并加载数据
+-	sessionID := fmt.Sprintf("table_summary_%s", resources.knowledge.ID)
+-	fileSvc := s.resolveFileServiceForKnowledge(ctx, resources)
+-	duckdbTool := tools.NewDataAnalysisTool(s.knowledgeBaseService, s.knowledgeService, s.tenantService, fileSvc, s.sqlDB, sessionID, s.storageResolver)
+-	defer duckdbTool.Cleanup(ctx)
+-
+-	// 使用knowledge.ID作为表名，根据文件类型自动加载数据
+-	tableSchema, err := duckdbTool.LoadFromKnowledge(ctx, resources.knowledge)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to load data into DuckDB: %v", err)
+-		return nil, err
+-	}
+-
+-	logger.Infof(ctx, "Loaded table %s with %d columns and %d rows", tableSchema.TableName, len(tableSchema.Columns), tableSchema.RowCount)
+-
+-	// 获取样本数据用于生成摘要
+-	input := tools.DataAnalysisInput{
+-		KnowledgeID: resources.knowledge.ID,
+-		Sql:         fmt.Sprintf("SELECT * FROM \"%s\" LIMIT 10", tableSchema.TableName),
+-	}
+-	jsonData, err := json.Marshal(input)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to marshal input: %v", err)
+-		return nil, err
+-	}
+-	sampleResult, err := duckdbTool.Execute(ctx, jsonData)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to get sample data: %v", err)
+-		return nil, err
+-	}
+-
+-	// 构建共用的schema和样本数据描述
+-	schemaDesc := tableSchema.Description()
+-	sampleDesc := s.buildSampleDataDescription(ctx, sampleResult, 10)
+-
+-	// 使用AI生成表格摘要和列描述
+-	customInstructions := ""
+-	if resources.knowledgeBase != nil {
+-		var processOverrides *types.KnowledgeProcessOverrides
+-		if resources.knowledge != nil {
+-			processOverrides, _ = resources.knowledge.ProcessOverrides()
+-		}
+-		customInstructions = ResolveProcessConfig(resources.knowledgeBase, processOverrides).ChunkingConfig.TableMetadataInstructions
+-	}
+-	tableDescription, err := s.generateTableDescription(ctx, resources.chatModel, tableSchema.TableName,
+-		schemaDesc, sampleDesc, customInstructions)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to generate table description: %v", err)
+-		return nil, err
+-	}
+-	logger.Debugf(ctx, "table describe of knowledge %s: %s", resources.knowledge.ID, tableDescription)
+-
+-	columnDescription, err := s.generateColumnDescriptions(ctx, resources.chatModel, tableSchema.TableName,
+-		schemaDesc, sampleDesc, customInstructions)
+-	if err != nil {
+-		logger.Errorf(ctx, "failed to generate column descriptions: %v", err)
+-		return nil, err
+-	}
+-	logger.Debugf(ctx, "column describe of knowledge %s: %s", resources.knowledge.ID, columnDescription)
+-
+-	// 构建chunks：一个表格摘要chunk + 多个列描述chunks
+-	chunks := s.buildChunks(resources, tableDescription, columnDescription)
+-	return chunks, nil
+-}
+-
+-// buildChunks 构建chunk对象
+-// tableDescription和columnDescriptions分别生成一个chunk
+-func (s *DataTableSummaryService) buildChunks(resources *extractionResources, tableDescription string, columnDescription string) []*types.Chunk {
+-	chunks := make([]*types.Chunk, 0, 2)
+-
+-	// 表格摘要chunk
+-	summaryChunk := &types.Chunk{
+-		ID:              uuid.New().String(),
+-		TenantID:        resources.knowledge.TenantID,
+-		KnowledgeID:     resources.knowledge.ID,
+-		KnowledgeBaseID: resources.knowledge.KnowledgeBaseID,
+-		Content:         tableDescription,
+-		ChunkIndex:      0,
+-		IsEnabled:       true,
+-		ChunkType:       types.ChunkTypeTableSummary,
+-		Status:          int(types.ChunkStatusStored),
+-	}
+-	chunks = append(chunks, summaryChunk)
+-
+-	// 列描述chunk（所有列的描述合并为一个chunk）
+-	columnChunk := &types.Chunk{
+-		ID:              uuid.New().String(),
+-		TenantID:        resources.knowledge.TenantID,
+-		KnowledgeID:     resources.knowledge.ID,
+-		KnowledgeBaseID: resources.knowledge.KnowledgeBaseID,
+-		Content:         columnDescription,
+-		ChunkIndex:      1,
+-		IsEnabled:       true,
+-		ChunkType:       types.ChunkTypeTableColumn,
+-		ParentChunkID:   summaryChunk.ID,
+-		Status:          int(types.ChunkStatusStored),
+-	}
+-	chunks = append(chunks, columnChunk)
+-
+-	summaryChunk.NextChunkID = columnChunk.ID
+-	columnChunk.PreChunkID = summaryChunk.ID
+-
+-	return chunks
+-}
+-
+-// indexToVectorDB 将chunks索引到向量数据库
+-// 思路：批量构建索引信息，统一索引，更新状态
+-func (s *DataTableSummaryService) indexToVectorDB(
+-	ctx context.Context,
+-	chunks []*types.Chunk,
+-	engine *retriever.CompositeRetrieveEngine,
+-	embedder embedding.Embedder,
+-) error {
+-	// 构建索引信息列表
+-	indexInfoList := make([]*types.IndexInfo, 0, len(chunks))
+-	for _, chunk := range chunks {
+-		indexInfoList = append(indexInfoList, &types.IndexInfo{
+-			Content:         chunk.Content,
+-			SourceID:        chunk.ID,
+-			SourceType:      types.ChunkSourceType,
+-			ChunkID:         chunk.ID,
+-			KnowledgeID:     chunk.KnowledgeID,
+-			KnowledgeBaseID: chunk.KnowledgeBaseID,
+-			IsEnabled:       true,
+-		})
+-	}
+-
+-	// 保存到数据库
+-	if err := s.chunkService.CreateChunks(ctx, chunks); err != nil {
+-		logger.Errorf(ctx, "failed to create chunks: %v", err)
+-		return err
+-	}
+-	logger.Infof(ctx, "Created %d chunks for data table", len(chunks))
+-
+-	// 批量索引
+-	if err := engine.BatchIndex(ctx, embedder, indexInfoList); err != nil {
+-		logger.Errorf(ctx, "failed to index chunks: %v", err)
+-		return err
+-	}
+-
+-	// 更新chunk状态为已索引
+-	for _, chunk := range chunks {
+-		chunk.Status = int(types.ChunkStatusIndexed)
+-	}
+-	if err := s.chunkService.UpdateChunks(ctx, chunks); err != nil {
+-		logger.Errorf(ctx, "failed to update chunk status: %v", err)
+-		return err
+-	}
+-
+-	return nil
+-}
+-
+-// cleanupOnFailure 索引失败时的清理工作
+-// 思路：删除已创建的chunk和对应的向量索引，避免脏数据残留
+-func (s *DataTableSummaryService) cleanupOnFailure(ctx context.Context, resources *extractionResources, chunks []*types.Chunk, indexErr error) {
+-	logger.Warnf(ctx, "Starting cleanup due to failure: %v", indexErr)
+-
+-	// 1. 更新知识状态为失败
+-	resources.knowledge.ParseStatus = types.ParseStatusFailed
+-	resources.knowledge.ErrorMessage = indexErr.Error()
+-	if err := s.knowledgeService.UpdateKnowledge(ctx, resources.knowledge); err != nil {
+-		logger.Errorf(ctx, "Failed to update knowledge status: %v", err)
+-	} else {
+-		logger.Infof(ctx, "Updated knowledge %s status to failed", resources.knowledge.ID)
+-	}
+-
+-	// 提取chunk IDs
+-	chunkIDs := make([]string, 0, len(chunks))
+-	for _, chunk := range chunks {
+-		chunkIDs = append(chunkIDs, chunk.ID)
+-	}
+-
+-	// 删除已创建的chunks
+-	if len(chunkIDs) > 0 {
+-		if err := s.chunkService.DeleteChunks(ctx, chunkIDs); err != nil {
+-			logger.Errorf(ctx, "Failed to delete chunks: %v", err)
+-		} else {
+-			logger.Infof(ctx, "Deleted %d chunks", len(chunkIDs))
+-		}
+-	}
+-
+-	// 删除对应的向量索引
+-	if len(chunkIDs) > 0 {
+-		if err := resources.retrieveEngine.DeleteBySourceIDList(
+-			ctx, chunkIDs, resources.embeddingModel.GetDimensions(), types.KnowledgeBaseTypeDocument,
+-		); err != nil {
+-			logger.Errorf(ctx, "Failed to delete vector index: %v", err)
+-		} else {
+-			logger.Infof(ctx, "Deleted vector index for %d chunks", len(chunkIDs))
+-		}
+-	}
+-
+-	logger.Infof(ctx, "Cleanup completed")
+-}
+-
+-// generateTableDescription generates a summary description for the entire table
+-func (s *DataTableSummaryService) generateTableDescription(ctx context.Context, chatModel chat.Chat,
+-	tableName, schemaDesc, sampleDesc, customInstructions string,
+-) (string, error) {
+-	prompt := fmt.Sprintf(tableDescriptionPromptTemplate, tableName, schemaDesc, sampleDesc)
+-	prompt = types.AppendCustomPromptInstructions(prompt, customInstructions, "table_metadata")
+-	// logger.Debugf(ctx, "generateTableDescription prompt: %s", prompt)
+-
+-	thinking := false
+-	response, err := chatModel.Chat(ctx, []chat.Message{
+-		{Role: "user", Content: prompt},
+-	}, &chat.ChatOptions{
+-		Temperature: 0.3,
+-		MaxTokens:   512,
+-		Thinking:    &thinking,
+-	})
+-	if err != nil {
+-		return "", fmt.Errorf("failed to generate table description: %w", err)
+-	}
+-
+-	return fmt.Sprintf("# Table Summary\n\nTable name: %s\n\n%s", tableName, response.Content), nil
+-}
+-
+-// generateColumnDescriptions generates descriptions for each column in batch
+-func (s *DataTableSummaryService) generateColumnDescriptions(ctx context.Context, chatModel chat.Chat,
+-	tableName, schemaDesc, sampleDesc, customInstructions string,
+-) (string, error) {
+-	// Build batch prompt for all columns
+-	prompt := fmt.Sprintf(columnDescriptionsPromptTemplate, tableName, schemaDesc, sampleDesc)
+-	prompt = types.AppendCustomPromptInstructions(prompt, customInstructions, "table_metadata")
+-	// logger.Debugf(ctx, "generateColumnDescriptions prompt: %s", prompt)
+-
+-	// Call LLM once for all columns
+-	thinking := false
+-	response, err := chatModel.Chat(ctx, []chat.Message{
+-		{Role: "user", Content: prompt},
+-	}, &chat.ChatOptions{
+-		Temperature: 0.3,
+-		MaxTokens:   2048,
+-		Thinking:    &thinking,
+-	})
+-	if err != nil {
+-		return "", fmt.Errorf("failed to generate column descriptions: %w", err)
+-	}
+-
+-	return fmt.Sprintf("# Table Column Information\n\nTable name: %s\n\n%s", tableName, response.Content), nil
+-}
+-
+-// buildSampleDataDescription builds a formatted sample data description
+-func (s *DataTableSummaryService) buildSampleDataDescription(ctx context.Context, sampleData *types.ToolResult, maxRows int) string {
+-	var builder strings.Builder
+-	builder.WriteString(fmt.Sprintf("Sample data (first %d rows):\n", maxRows))
+-
+-	if sampleData == nil || sampleData.Data == nil {
+-		return builder.String()
+-	}
+-
+-	rawRows, exists := sampleData.Data["rows"]
+-	if !exists || rawRows == nil {
+-		return builder.String()
+-	}
+-
+-	// DataAnalysisTool returns []map[string]string. A decoded ToolResult can
+-	// instead contain []map[string]interface{}, so normalize both shapes before
+-	// serializing the sample rows.
+-	var rows []interface{}
+-	switch typedRows := rawRows.(type) {
+-	case []map[string]string:
+-		rows = make([]interface{}, len(typedRows))
+-		for i, row := range typedRows {
+-			rows[i] = row
+-		}
+-	case []map[string]interface{}:
+-		rows = make([]interface{}, len(typedRows))
+-		for i, row := range typedRows {
+-			rows[i] = row
+-		}
+-	default:
+-		logger.Warnf(ctx, "[TableSummary] Unsupported sample rows type: %T", rawRows)
+-		return builder.String()
+-	}
+-
+-	for i, row := range rows {
+-		if i >= maxRows {
+-			break
+-		}
+-		jsonBytes, err := json.Marshal(row)
+-		if err != nil {
+-			continue
+-		}
+-		builder.WriteString(string(jsonBytes))
+-		builder.WriteString("\n")
+-	}
+-
+-	return builder.String()
+-}
+diff --git a/internal/application/service/extract_data_table_summary_test.go b/internal/application/service/extract_data_table_summary_test.go
+deleted file mode 100644
+index 4c059ef..0000000
+--- a/internal/application/service/extract_data_table_summary_test.go
++++ /dev/null
+@@ -1,65 +0,0 @@
+-package service
+-
+-import (
+-	"context"
+-	"strings"
+-	"testing"
+-
+-	"github.com/Tencent/WeKnora/internal/types"
+-)
+-
+-func TestBuildSampleDataDescriptionIncludesDataAnalysisRows(t *testing.T) {
+-	service := &DataTableSummaryService{}
+-	result := &types.ToolResult{Data: map[string]interface{}{
+-		"rows": []map[string]string{
+-			{"date": "20250101", "status": "approved"},
+-			{"date": "20250102", "status": "pending"},
+-		},
+-	}}
+-
+-	got := service.buildSampleDataDescription(context.Background(), result, 10)
+-	for _, want := range []string{
+-		`"date":"20250101"`,
+-		`"status":"approved"`,
+-		`"date":"20250102"`,
+-		`"status":"pending"`,
+-	} {
+-		if !strings.Contains(got, want) {
+-			t.Errorf("sample description missing %s:\n%s", want, got)
+-		}
+-	}
+-}
+-
+-func TestBuildSampleDataDescriptionSupportsDecodedRows(t *testing.T) {
+-	service := &DataTableSummaryService{}
+-	result := &types.ToolResult{Data: map[string]interface{}{
+-		"rows": []map[string]interface{}{
+-			{"date": "20250101", "count": float64(3)},
+-		},
+-	}}
+-
+-	got := service.buildSampleDataDescription(context.Background(), result, 10)
+-	for _, want := range []string{`"date":"20250101"`, `"count":3`} {
+-		if !strings.Contains(got, want) {
+-			t.Errorf("sample description missing %s:\n%s", want, got)
+-		}
+-	}
+-}
+-
+-func TestBuildSampleDataDescriptionLimitsRows(t *testing.T) {
+-	service := &DataTableSummaryService{}
+-	result := &types.ToolResult{Data: map[string]interface{}{
+-		"rows": []map[string]string{
+-			{"id": "first"},
+-			{"id": "second"},
+-		},
+-	}}
+-
+-	got := service.buildSampleDataDescription(context.Background(), result, 1)
+-	if !strings.Contains(got, `"id":"first"`) {
+-		t.Fatalf("first row missing:\n%s", got)
+-	}
+-	if strings.Contains(got, `"id":"second"`) {
+-		t.Fatalf("sample limit was ignored:\n%s", got)
+-	}
+-}
+diff --git a/internal/application/service/knowledge_create.go b/internal/application/service/knowledge_create.go
+index 410a2be8..fa586a6 100644
+--- a/internal/application/service/knowledge_create.go
++++ b/internal/application/service/knowledge_create.go
+@@ -271,8 +271,6 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
+ 		knowledge.ID,
+ 	)
+ 
+-	enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, knowledge.ID, safeFilename, getFileType(safeFilename), kb.SummaryModelID, kb.EmbeddingModelID)
+-
+ 	logger.Infof(ctx, "Knowledge from file created successfully, ID: %s", knowledge.ID)
+ 	return knowledge, nil
+ }
+@@ -703,8 +701,6 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
+ 		})
+ 	logger.Infof(ctx, "Enqueued file URL process task: id=%s queue=%s knowledge_id=%s", info.ID, info.Queue, knowledge.ID)
+ 
+-	enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, knowledge.ID, fileName, fileType, kb.SummaryModelID, kb.EmbeddingModelID)
+-
+ 	logger.Infof(ctx, "Knowledge from file URL created successfully, ID: %s", knowledge.ID)
+ 	return knowledge, nil
+ }
+diff --git a/internal/application/service/knowledge_process.go b/internal/application/service/knowledge_process.go
+index ce9365f..18733fc 100644
+--- a/internal/application/service/knowledge_process.go
++++ b/internal/application/service/knowledge_process.go
+@@ -2579,7 +2579,6 @@ func (s *knowledgeService) ReparseKnowledge(
+ 		recordReparseStarted()
+ 
+ 		// For data tables (csv, xlsx, xls), also enqueue summary task
+-		enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, existing.ID, existing.FileName, existing.FileType, kb.SummaryModelID, kb.EmbeddingModelID)
+ 
+ 		return existing, nil
+ 	}
+@@ -2632,8 +2631,6 @@ func (s *knowledgeService) ReparseKnowledge(
+ 		logger.Infof(ctx, "Enqueued file URL reparse task: id=%s queue=%s knowledge_id=%s", info.ID, info.Queue, existing.ID)
+ 		recordReparseStarted()
+ 
+-		enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, existing.ID, existing.FileName, existing.FileType, kb.SummaryModelID, kb.EmbeddingModelID)
+-
+ 		return existing, nil
+ 	}
+ 
+diff --git a/internal/container/container.go b/internal/container/container.go
+index 19230a1..3217dbe 100644
+--- a/internal/container/container.go
++++ b/internal/container/container.go
+@@ -18,7 +18,6 @@ import (
+ 	"time"
+ 
+ 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
+-	_ "github.com/duckdb/duckdb-go/v2"
+ 	esv7 "github.com/elastic/go-elasticsearch/v7"
+ 	"github.com/elastic/go-elasticsearch/v8"
+ 	_ "github.com/go-sql-driver/mysql" // 给 Doris (database/sql) 注册 MySQL 协议驱动
+@@ -137,9 +136,6 @@ func BuildContainer(container *dig.Container) *dig.Container {
+ 	must(container.Provide(initOllamaService))
+ 	must(container.Provide(initNeo4jClient))
+ 	must(container.Provide(stream.NewStreamManager))
+-	logger.Debugf(ctx, "[Container] Initializing DuckDB...")
+-	must(container.Provide(NewDuckDB))
+-	logger.Debugf(ctx, "[Container] DuckDB registered")
+ 
+ 	// Data repositories layer
+ 	logger.Debugf(ctx, "[Container] Registering repositories...")
+@@ -233,7 +229,6 @@ func BuildContainer(container *dig.Container) *dig.Container {
+ 
+ 	// Extract services - register individual extracters with names
+ 	must(container.Provide(service.NewChunkExtractService, dig.Name("chunkExtractor")))
+-	must(container.Provide(service.NewDataTableSummaryService, dig.Name("dataTableSummary")))
+ 	must(container.Provide(service.NewImageMultimodalService, dig.Name("imageMultimodal")))
+ 	must(container.Provide(service.NewKnowledgePostProcessService, dig.Name("knowledgePostProcess")))
+ 	must(container.Provide(service.NewKnowledgeAutoTagService, dig.Name("knowledgeAutoTag")))
+@@ -367,7 +362,6 @@ func BuildContainer(container *dig.Container) *dig.Container {
+ 	must(container.Invoke(chatpipeline.NewPluginRerank))
+ 	must(container.Invoke(chatpipeline.NewPluginWebFetch))
+ 	must(container.Invoke(chatpipeline.NewPluginMerge))
+-	must(container.Invoke(chatpipeline.NewPluginDataAnalysis))
+ 	must(container.Invoke(chatpipeline.NewPluginIntoChatMessage))
+ 	must(container.Invoke(chatpipeline.NewPluginChatCompletion))
+ 	must(container.Invoke(chatpipeline.NewPluginChatCompletionStream))
+@@ -1580,39 +1574,6 @@ func initNeo4jClient() (neo4j.Driver, error) {
+ 	return nil, fmt.Errorf("failed to connect to Neo4j after %d attempts: %w", maxRetries, err)
+ }
+ 
+-func NewDuckDB() (*sql.DB, error) {
+-	sqlDB, err := sql.Open("duckdb", ":memory:")
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to open duckdb: %w", err)
+-	}
+-
+-	// Try to install and load required extensions unless explicitly disabled.
+-	//   - spatial: used for st_read_meta() to enumerate layer (sheet) names from .xlsx/.xls
+-	//   - excel:   used for read_xlsx() which gives proper type inference per sheet
+-	//
+-	// INSTALL hits extensions.duckdb.org (public internet). In locked-down
+-	// runtimes with no egress, set DUCKDB_SKIP_EXTENSION_LOAD=1 to avoid a
+-	// startup hang; xlsx/xls ingest may fail later without these extensions.
+-	if strings.EqualFold(os.Getenv("DUCKDB_SKIP_EXTENSION_LOAD"), "true") ||
+-		os.Getenv("DUCKDB_SKIP_EXTENSION_LOAD") == "1" {
+-		logger.Infof(context.Background(),
+-			"[DuckDB] Skipping spatial/excel extension install/load "+
+-				"(DUCKDB_SKIP_EXTENSION_LOAD is set; xlsx ingest may fail without them)")
+-	} else {
+-		bgCtx := context.Background()
+-		for _, ext := range []string{"spatial", "excel"} {
+-			if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
+-				logger.Warnf(bgCtx, "[DuckDB] Failed to install %s extension: %v", ext, err)
+-			}
+-			if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
+-				logger.Warnf(bgCtx, "[DuckDB] Failed to load %s extension: %v", ext, err)
+-			}
+-		}
+-	}
+-
+-	return sqlDB, nil
+-}
+-
+ // registerWebSearchProviders registers all web search provider types to the registry.
+ // Each provider type is registered with its factory function that accepts parameters.
+ // Provider instances are created on-demand when tenants configure them.
+diff --git a/internal/router/sync_task.go b/internal/router/sync_task.go
+index e65b96a..de43400 100644
+--- a/internal/router/sync_task.go
++++ b/internal/router/sync_task.go
+@@ -124,7 +124,7 @@ type SyncTaskParams struct {
+ 	TagService           interfaces.KnowledgeTagService
+ 	DataSourceService    interfaces.DataSourceService
+ 	ChunkExtractor       interfaces.TaskHandler `name:"chunkExtractor"`
+-	DataTableSummary     interfaces.TaskHandler `name:"dataTableSummary"`
++
+ 	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
+ 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
+ 	KnowledgeAutoTag     interfaces.TaskHandler `name:"knowledgeAutoTag"`
+@@ -137,7 +137,6 @@ type SyncTaskParams struct {
+ // Used in Lite mode instead of RunAsynqServer.
+ func RegisterSyncHandlers(params SyncTaskParams) {
+ 	params.Executor.RegisterHandler(types.TypeChunkExtract, params.ChunkExtractor.Handle)
+-	params.Executor.RegisterHandler(types.TypeDataTableSummary, params.DataTableSummary.Handle)
+ 	params.Executor.RegisterHandler(types.TypeDocumentProcess, params.KnowledgeService.ProcessDocument)
+ 	params.Executor.RegisterHandler(types.TypeTemporaryDocumentProcess, params.TemporaryDocument.Process)
+ 	params.Executor.RegisterHandler(types.TypeManualProcess, params.KnowledgeService.ProcessManualUpdate)
+diff --git a/internal/router/task.go b/internal/router/task.go
+index 7dcd6d3..bbeae26 100644
+--- a/internal/router/task.go
++++ b/internal/router/task.go
+@@ -39,7 +39,7 @@ type AsynqTaskParams struct {
+ 	TagService           interfaces.KnowledgeTagService
+ 	DataSourceService    interfaces.DataSourceService
+ 	ChunkExtractor       interfaces.TaskHandler `name:"chunkExtractor"`
+-	DataTableSummary     interfaces.TaskHandler `name:"dataTableSummary"`
++
+ 	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
+ 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
+ 	KnowledgeAutoTag     interfaces.TaskHandler `name:"knowledgeAutoTag"`
+@@ -261,7 +261,6 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
+ 
+ 	// Register extract handlers - router will dispatch to appropriate handler
+ 	mux.HandleFunc(types.TypeChunkExtract, params.ChunkExtractor.Handle)
+-	mux.HandleFunc(types.TypeDataTableSummary, params.DataTableSummary.Handle)
+ 
+ 	// Register document processing handler
+ 	mux.HandleFunc(types.TypeDocumentProcess, params.KnowledgeService.ProcessDocument)

@@ -1,0 +1,58 @@
+name: solo-lite-windows
+
+# Solo 版 WeKnora Lite（Windows/amd64）构件工作流。
+# 上游 Docker/Linux 工作流保持不动；本工作流只构建 cmd/server（EDITION=lite），
+# 走 solo/scripts/build-windows.sh（应用 solo/patches/*.patch → 生成 sqlite3.h → CGO 编译）。
+on:
+  push:
+    branches: [solo]
+    paths:
+      - 'solo/**'
+      - '.github/workflows/solo-lite-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-amd64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+
+      - name: Build (EDITION=lite, sqlite_fts5)
+        shell: msys2 {0}
+        run: bash solo/scripts/build-windows.sh
+
+      - name: SHA256
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/WeKnora-lite.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  WeKnora-lite.exe" | Out-File -Encoding ascii -NoNewline dist/WeKnora-lite.exe.sha256
+          Write-Host (Get-Content dist/WeKnora-lite.exe.sha256)
+          Write-Host ("size={0:N1} MB" -f ((Get-Item dist/WeKnora-lite.exe).Length / 1MB))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weknora-lite-windows-amd64
+          path: |
+            dist/WeKnora-lite.exe
+            dist/WeKnora-lite.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
