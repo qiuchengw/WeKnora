@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1605,27 +1606,88 @@ func NewDuckDB() (*sql.DB, error) {
 	//   - spatial: used for st_read_meta() to enumerate layer (sheet) names from .xlsx/.xls
 	//   - excel:   used for read_xlsx() which gives proper type inference per sheet
 	//
-	// INSTALL hits extensions.duckdb.org (public internet). In locked-down
-	// runtimes with no egress, set DUCKDB_SKIP_EXTENSION_LOAD=1 to avoid a
-	// startup hang; xlsx/xls ingest may fail later without these extensions.
+	// INSTALL hits extensions.duckdb.org (public internet). Every extension statement below is
+	// **bounded** (see prepareDuckDBExtension): a locked-down runtime without egress degrades to
+	// a warning instead of hanging the whole startup. DUCKDB_SKIP_EXTENSION_LOAD=1 still skips
+	// the attempt entirely (xlsx/xls ingest may fail without these extensions).
 	if strings.EqualFold(os.Getenv("DUCKDB_SKIP_EXTENSION_LOAD"), "true") ||
 		os.Getenv("DUCKDB_SKIP_EXTENSION_LOAD") == "1" {
 		logger.Infof(context.Background(),
 			"[DuckDB] Skipping spatial/excel extension install/load "+
 				"(DUCKDB_SKIP_EXTENSION_LOAD is set; xlsx ingest may fail without them)")
 	} else {
-		bgCtx := context.Background()
+		// Fresh extensions must never turn into an unbounded startup wait. DuckDB's own download
+		// retries ignore our deadline (measured ~80s of INSTALL on a blackholed network), so we do
+		// not even try INSTALL unless the extension repository is reachable (2s probe). LOAD is
+		// attempted first and needs no network when the extension is installed / pre-seeded.
+		ctx, cancel := context.WithTimeout(context.Background(), duckdbExtensionBudget())
+		defer cancel()
+		if err := duckdbExecCtx(ctx, sqlDB, "SET autoinstall_known_extensions=false;"); err != nil {
+			logger.Warnf(ctx, "[DuckDB] failed to disable autoinstall_known_extensions: %v", err)
+		}
+		reachable := duckdbExtensionRepoReachable()
 		for _, ext := range []string{"spatial", "excel"} {
-			if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
-				logger.Warnf(bgCtx, "[DuckDB] Failed to install %s extension: %v", ext, err)
-			}
-			if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
-				logger.Warnf(bgCtx, "[DuckDB] Failed to load %s extension: %v", ext, err)
+			if err := prepareDuckDBExtension(ctx, sqlDB, ext, reachable); err != nil {
+				logger.Warnf(ctx, "[DuckDB] %v (xlsx/xls ingest may fail; other features unaffected)", err)
 			}
 		}
 	}
 
 	return sqlDB, nil
+}
+
+// prepareDuckDBExtension loads a DuckDB extension, installing it only when it is missing AND the
+// extension repository is reachable. Offline runtimes therefore pay (at most) one short probe
+// instead of a long download timeout, and startup always proceeds.
+func prepareDuckDBExtension(ctx context.Context, sqlDB *sql.DB, ext string, repoReachable bool) error {
+	if err := duckdbExecCtx(ctx, sqlDB, fmt.Sprintf("LOAD %s;", ext)); err == nil {
+		return nil
+	}
+	if !repoReachable {
+		return fmt.Errorf("%s extension not installed and extensions.duckdb.org unreachable (3s probe): skipped", ext)
+	}
+	if err := duckdbExecCtx(ctx, sqlDB, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
+		return fmt.Errorf("failed to install %s extension: %w", ext, err)
+	}
+	if err := duckdbExecCtx(ctx, sqlDB, fmt.Sprintf("LOAD %s;", ext)); err != nil {
+		return fmt.Errorf("failed to load %s extension: %w", ext, err)
+	}
+	return nil
+}
+
+// duckdbExecCtx runs one extension statement under the shared deadline (best effort: it bounds
+// queueing/waiting, while the reachability probe covers the download path).
+func duckdbExecCtx(ctx context.Context, sqlDB *sql.DB, query string) error {
+	_, err := sqlDB.ExecContext(ctx, query)
+	return err
+}
+
+// duckdbExtensionRepoReachable probes the extension repository over **HTTPS** with a short timeout.
+// A plain TCP connect is not sufficient: proxies/firewalls may accept the connection and then stall,
+// and DuckDB's download ignores statement deadlines (measured: startup stuck inside `INSTALL`).
+// Set DUCKDB_FORCE_EXTENSION_INSTALL=1 to bypass the probe when it is itself blocked while egress works.
+func duckdbExtensionRepoReachable() bool {
+	if v := strings.TrimSpace(os.Getenv("DUCKDB_FORCE_EXTENSION_INSTALL")); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Head("https://extensions.duckdb.org/")
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return true
+}
+
+// duckdbExtensionBudget returns the TOTAL budget for extension preparation (downloads included);
+// override with DUCKDB_EXTENSION_TIMEOUT_SECONDS.
+func duckdbExtensionBudget() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("DUCKDB_EXTENSION_TIMEOUT_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 60 * time.Second
 }
 
 // registerWebSearchProviders registers all web search provider types to the registry.
