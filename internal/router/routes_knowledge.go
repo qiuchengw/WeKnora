@@ -64,7 +64,7 @@ func RegisterChunkRoutes(r *gin.RouterGroup, handler *handler.ChunkHandler, g *r
 // reuse OwnedKBOrAdmin because the URL :id is the KB id directly.
 // Body-scoped batch operations have a Contributor route gate and resolve
 // their KB ownership plus Editor operation grant inside the handler.
-func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, g *rbacGuards) {
+func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, dataQueryHandler *handler.KnowledgeDataQueryHandler, g *rbacGuards) {
 	// 知识库下的知识路由组（URL :id is the KB id）。Scoped API key 需要
 	// ingest 能力才能写内容，且仍受 KB 范围限制；清空 KB 只允许 full-access key。
 	kb := g.apiKeyGroup(r.Group("/knowledge-bases/:id/knowledge"), apiKeyIngest(apiKeyFullAccess()))
@@ -103,6 +103,12 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		kRead.GET("/:id", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledge)
 		kRead.GET("/:id/stages", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledgeSpans)
 		kRead.GET("/:id/spans", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.GetKnowledgeSpans)
+		// Tabular-data capability endpoints (ADR-0019 D-18 E2/E3): the same DuckDB
+		// execution path the built-in agent's data tools use, with the caller
+		// (not an agent) planning the query. Retrieve capability + KB read scope,
+		// so they grant nothing the caller could not already read.
+		kRead.GET("/:id/data-schema", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), dataQueryHandler.DataSchema)
+		kRead.POST("/:id/data-analysis", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), dataQueryHandler.DataAnalysis)
 		k.DELETE("/:id", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.DeleteKnowledge)
 		k.PUT("/:id", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.UpdateKnowledge)
 		k.POST("/:id/regenerate-summary", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.RegenerateKnowledgeSummary)
