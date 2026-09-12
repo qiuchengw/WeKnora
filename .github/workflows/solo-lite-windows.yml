@@ -10,6 +10,11 @@ on:
       - 'solo/**'
       - '.github/workflows/solo-lite-windows.yml'
   workflow_dispatch:
+    inputs:
+      with_patches:
+        description: 'Build with strip patches (optional; removes data_analysis/data_schema)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,9 +41,18 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
           path-type: inherit
 
-      - name: Build (EDITION=lite, sqlite_fts5)
+      - name: Build (EDITION=lite, sqlite_fts5, zero-patch by default)
         shell: msys2 {0}
-        run: bash solo/scripts/build-windows.sh
+        env:
+          WITH_PATCHES: ${{ github.event.inputs.with_patches }}
+        run: |
+          if [ "${WITH_PATCHES:-false}" = "true" ]; then
+            echo '>> variant: with strip patches'
+            bash solo/scripts/build-windows.sh --with-patches
+          else
+            echo '>> variant: zero-patch (canonical)'
+            bash solo/scripts/build-windows.sh
+          fi
 
       - name: SHA256
         shell: pwsh

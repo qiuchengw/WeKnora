@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Solo 版 WeKnora Lite（cmd/server，Windows/amd64）构建脚本。
 #
-# 流程：应用 solo/patches/*.patch（剥离 Lite 不可达能力）→ 生成 sqlite3.h 构建输入头
-#       → CGO 编译（EDITION=lite + sqlite_fts5 + 静态链接 MinGW 运行时）。
+# 流程：默认**零补丁**（上游源码零改动）→ 生成 sqlite3.h 构建输入头 → CGO 编译
+#       （EDITION=lite + sqlite_fts5 + 静态链接 MinGW 运行时）。
+#       `--with-patches` 时才应用 solo/patches/*.patch（体积极敏场景，会影响能力面）。
 #
 # 用法（在仓库根执行）：
-#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols] [--no-patches]
+#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols] [--with-patches]
 #
 # 工具链：优先 $MINGW_BIN（目录含 gcc.exe），否则要求 PATH 上有 gcc（CI 用 msys2 UCRT64）。
 # 设计纪律：源码树零手改；补丁不能应用也不能回滚时**立即失败**，不做静默兜底。
@@ -15,12 +16,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"      # repo/solo
 SRC="$(cd "$ROOT/.." && pwd)"                  # repo
 OUT_NAME="WeKnora-lite.exe"
 KEEP_SYMBOLS=0
-APPLY_PATCHES=1
+APPLY_PATCHES=0          # 默认零补丁（ADR-0019 D-15）
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT_NAME="$2"; shift 2 ;;
     --keep-symbols) KEEP_SYMBOLS=1; shift ;;
+    --with-patches) APPLY_PATCHES=1; shift ;;
     --no-patches) APPLY_PATCHES=0; shift ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
@@ -36,7 +38,7 @@ export CXX="${CXX:-g++}"
 export EDITION=lite                 # 与上游 CI 一致；ldflags 注入 internal/handler.Edition
 export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
 
-# 1) 剥离补丁：能应用则应用；已应用则跳过；否则显式失败（上游已变，需刷新补丁）。
+# 1) 可选剥离补丁（--with-patches）：能应用则应用；已应用则跳过；否则显式失败（上游已变，需刷新补丁）。
 if [ "$APPLY_PATCHES" = 1 ]; then
   for p in "$ROOT"/patches/*.patch; do
     [ -e "$p" ] || continue
@@ -52,7 +54,6 @@ if [ "$APPLY_PATCHES" = 1 ]; then
     fi
   done
 fi
-
 # 2) 构建输入头：sqlite-vec 的 cgo 绑定在 SQLITE_CORE 下 `#include "sqlite3.h"`，
 #    而 mattn/go-sqlite3 只带 sqlite3-binding.h。把同一份 amalgamation 头复制为 sqlite3.h（不改源码树）。
 SHIM_DIR="${SHIM_DIR:-$ROOT/.build-headers}"
