@@ -45,7 +45,7 @@ bash solo/scripts/build-windows.sh --with-patches   # 可选：出剥离版（�
 ## 剥离补丁（可选，默认不启用）
 
 `patches/0001-strip-stage1.patch` = 18 文件 / −2472 行（DuckDB + 数据分析工具/管道 + 表格摘要任务与入队点 + 悬空 `data_schema`）。
-**启用会影响能力面**：`data_analysis`/`data_schema` 被删 ⇒ **问数不可用**（ADR-0019 D-16）。仅当体积/内存成为发布阻塞时用 `--with-patches`。
+**能力面影响已消解**：`data_analysis`/`data_schema` 是引擎**内置 Agent** 的工具，我们**不使用也不配置**（问数改由宿主 Agent 用已在栈内的 DuckDB 实现，见 ADR-0019 D-16）⇒ 剥离仅影响体积，不影响本产品能力。不要为了体积默认启用。
 
 ## 升级流程（上游出新 tag 时）——零补丁、零人工
 
@@ -63,5 +63,5 @@ bash solo/scripts/build-windows.sh          # 直接构建（默认零补丁）�
 ## 已知待办（后续阶段）
 
 - **体积极化（仅当成为阻塞）**：先试上游 build tag PR；剥离补丁只是应急开关。
-- **问数（ADR-0019 D-16）**：宿主 Agent 委派引擎 `agent-chat` + 内置 “Data Analyst” 预设；已知缺口：xlsx 依赖 DuckDB `excel` 扩展（运行时联网 INSTALL），CSV 离线可用。
+- **问数（ADR-0019 D-16，若产品要做）**：**宿主侧实现**（宿主 DuckDB `@duckdb/node-api`，CSV 聚合已实测；xlsx 需离线扩展或 JS 解析方案）——**不经过引擎 agent**，无需引擎侧配置。
 - 许可清单随包（`scripts/copy-licenses.sh`）与发布物装配（Solo 侧 W5）。
