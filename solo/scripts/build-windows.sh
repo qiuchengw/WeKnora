@@ -1,33 +1,28 @@
 #!/usr/bin/env bash
 # Solo 版 WeKnora Lite（cmd/server，Windows/amd64）构建脚本。
 #
-# 流程：默认应用 patches/（**能力补丁**，附加式：给引擎补上宿主需要、但上游尚未暴露的能力）
-#       → 生成 sqlite3.h 构建输入头 → CGO 编译
-#       （EDITION=lite + sqlite_fts5 + 静态链接 MinGW 运行时）。
-#       --with-strip 时额外应用 patches-optional/（体积剥离，应急）。
+# 车道模型（2026-09-12 收敛，取代 patch 文件车道）：
+#   **产物源码 = 本仓 `solo` 分支 HEAD**（上游 main + 我们的改动，一 commit 一上游 PR）。
+#   不再有 patches/ 目录，也没有「应用补丁」步骤：上游同步 = `git merge origin/main`（冲突一次解决）。
+#
+# 流程：生成 sqlite3.h 构建输入头 → CGO 编译（EDITION=lite + sqlite_fts5 + 静态链 MinGW 运行时）。
 #
 # 用法（在仓库根执行）：
-#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols] [--no-patches] [--with-strip]
+#   bash solo/scripts/build-windows.sh [--out NAME] [--keep-symbols]
 #
 # 工具链：优先 $MINGW_BIN（目录含 gcc.exe），否则要求 PATH 上有 gcc（CI 用 msys2 UCRT64）。
-# 设计纪律：源码树零手改；补丁不能应用也不能回滚时**立即失败**，不做静默兜底。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"      # repo/solo
 SRC="$(cd "$ROOT/.." && pwd)"                  # repo
 OUT_NAME="WeKnora-lite.exe"
 KEEP_SYMBOLS=0
-APPLY_PATCHES=1          # 默认应用 patches/（能力补丁，附加式；ADR-0019 D-18）
-APPLY_STRIP=0            # patches-optional/ 仅在 --with-strip 时应用（体积极敏场景）
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT_NAME="$2"; shift 2 ;;
     --keep-symbols) KEEP_SYMBOLS=1; shift ;;
-    --no-patches) APPLY_PATCHES=0; APPLY_STRIP=0; shift ;;
-    --with-strip) APPLY_STRIP=1; shift ;;
-    --with-patches) APPLY_PATCHES=1; shift ;;
-    *) echo "未知参数：$1" >&2; exit 2 ;;
+    *) echo "未知参数：$1（补丁车道的 --no-patches/--with-strip/--with-patches 已退役：源码即分支 HEAD）" >&2; exit 2 ;;
   esac
 done
 
@@ -41,40 +36,7 @@ export CXX="${CXX:-g++}"
 export EDITION=lite                 # 与上游 CI 一致；ldflags 注入 internal/handler.Edition
 export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
 
-# 1) 可选剥离补丁（--with-patches）：能应用则应用；已应用则跳过；否则显式失败（上游已变，需刷新补丁）。
-if [ "$APPLY_PATCHES" = 1 ]; then
-  for p in "$ROOT"/patches/*.patch; do
-    [ -e "$p" ] || continue
-    name="$(basename "$p")"
-    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
-      git -C "$SRC" apply "$p"
-      echo ">> patch applied: $name"
-    elif git -C "$SRC" apply --check -R "$p" 2>/dev/null; then
-      echo ">> patch already applied: $name"
-    else
-      echo "错误：$name 既不能应用也不处于已应用状态——上游代码已变化，请刷新补丁（git apply --3way）" >&2
-      exit 1
-    fi
-  done
-fi
-
-# 1c) 体积补丁（patches-optional/，需 --with-strip）：删除 Lite 不可达能力，仅当体积成为发布阻塞时用。
-if [ "$APPLY_STRIP" = 1 ]; then
-  for p in "$ROOT"/patches-optional/*.patch; do
-    [ -e "$p" ] || continue
-    name="optional/$(basename "$p")"
-    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
-      git -C "$SRC" apply "$p"
-      echo ">> patch applied: $name"
-    elif git -C "$SRC" apply --check -R "$p" 2>/dev/null; then
-      echo ">> patch already applied: $name"
-    else
-      echo "错误：$name 既不能应用也不处于已应用状态——请刷新补丁" >&2
-      exit 1
-    fi
-  done
-fi
-# 2) 构建输入头：sqlite-vec 的 cgo 绑定在 SQLITE_CORE 下 `#include "sqlite3.h"`，
+# 1) 构建输入头：sqlite-vec 的 cgo 绑定在 SQLITE_CORE 下 `#include "sqlite3.h"`，
 #    而 mattn/go-sqlite3 只带 sqlite3-binding.h。把同一份 amalgamation 头复制为 sqlite3.h（不改源码树）。
 SHIM_DIR="${SHIM_DIR:-$ROOT/.build-headers}"
 mkdir -p "$SHIM_DIR"
@@ -89,7 +51,7 @@ command -v cygpath >/dev/null && SHIM_INC="$(cygpath -m "$SHIM_DIR")"
 export CGO_CFLAGS="-Wno-deprecated-declarations -I$SHIM_INC"
 export CGO_CXXFLAGS="$CGO_CFLAGS"
 
-# 3) 编译
+# 2) 编译
 cd "$SRC"
 eval "$("$SRC/scripts/get_version.sh" env)"
 STRIP_FLAGS="-w -s"

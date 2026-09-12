@@ -1,14 +1,38 @@
 # `solo/` —— WeKnora 下游车道（Solo 知识库引擎）
 
-本目录是 **Solo 产品线对上游 WeKnora 的唯一增量**，且**只做构建、不改码**：上游源文件**零改动**（补丁仅在显式 `--with-patches` 时可选启用），所有差异以 **构建脚本 + CI** 形式存放于此。
+本目录是 **Solo 产品线对上游 WeKnora 的增量**，承载构建脚本与 CI 说明；**源码改动本身以 `solo` 分支的提交承载**（见下）。
 
-- 上游基线：`Tencent/WeKnora`（远端 `origin`；fork：`qiuchengw/WeKnora`，远端 `fork`，车道分支：`solo`）
-  - **当前基线 = 上游 `main` 合并点**（`2122a75`，2026-09-12 用户在 fork 侧同步；本地车道合并为 `d3a0113`）。历史基线 `v0.8.0`（tag）已升级。
-  - 发布物仍按**具体 commit SHA**记录（main 是移动目标；升级后重跑补丁验证与 golden）
-- 决策依据：`solo` 仓库 `docs/adr/0019-kb-engine-externalization.md`（D-13 构建来源纪律、**D-15 零补丁 canonical**、D-16 问数归属）
+- 上游基线：`Tencent/WeKnora`（远端 `origin`；fork：`qiuchengw/WeKnora`，远端 `fork-ssh`，车道分支：`solo`）
+  - **当前基线 = 上游 `main` 合并点**（`2122a75`，2026-09-12 用户在 fork 侧同步）。
+  - 发布物按**具体 commit SHA** 记录：上游基线 SHA + 本车道分支 SHA + 构建命令 + SHA256（`main` 是移动目标）。
+- 决策依据：`solo` 仓库 `docs/adr/0019-kb-engine-externalization.md`（D-13 构建来源纪律、D-15 车道模型、D-16 问数归属）。
 - 形态：**单进程无头服务**（`cmd/server`，`EDITION=lite`），由 Solo 宿主 spawn 一个子进程，走 `127.0.0.1 + token`。
 
-## 为什么需要本车道（但不需要改码）
+## 车道模型（2026-09-12 收敛：分支提交，不再是 patch 文件）
+
+**产物源码 = 本仓 `solo` 分支 HEAD**（上游 `main` + 我们的改动）。
+
+| | patch 文件车道（已退役） | **分支提交车道（现行）** |
+|---|---|---|
+| 我们的改动存放 | `solo/patches/*.patch`（构建时 `git apply`） | `solo` 分支上的提交（**一 commit = 一个上游 PR 候选**） |
+| 上游漂移 | 每个 patch 逐个 3-way + **重新生成 patch 文件** | `git merge origin/main`，冲突在 git 里解决一次 |
+| 真相数量 | 两处：patch 文件 + 工作树「设计态」脏 | 一处：分支 HEAD（`git status` 干净） |
+| 构建 | 需先应用补丁（失败要显式报错兜底） | 直接构建当前分支 |
+
+- 为何退役：patch 只是同一份分叉的另一种编码，却把「上游一动」变成「逐个重生成」的持续成本；git merge 的 3-way 能力显著强于 `git apply` 的上下文匹配。
+- 保留的纪律：**一个 commit = 一个上游 PR 候选**（commit message 写明动机 + 实测证据），便于随时逐个提 PR；上游合并后对应 commit 自然成为空操作（rebase/merge 时消失）。
+- 纯上游对照构建：直接 `git checkout origin/main` 构建，不再需要 `--no-patches`。
+
+**车道当前内容（`git log origin/main..solo`）**：
+
+| commit | 变更 | 性质 |
+|---|---|---|
+| `02d3ea5` | E1 passage enrichment（标题进入重排语料，修 title-blind rerank） | 能力修复（上游 PR 候选） |
+| `6364086` | `hybrid-search` 支持 `enable_rerank`（含单测；重排失败回退融合序） | 能力端点（上游 PR 候选） |
+| `bf2f05e` | 问数端点 `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema` | 能力端点（上游 PR 候选） |
+| `2d558e4` | DuckDB 扩展安装**离线优先 + 探活门控**（无外网不再卡启动） | 健壮性（上游 PR 候选） |
+
+## 为什么需要本车道（但源码改动很少）
 
 上游 Lite 目标在 Linux 上可零改码构建，Windows 上需要**两个构建期适配**（均不改源码）：
 
@@ -18,19 +42,15 @@
 | `sqlite-vec` cgo 在 `SQLITE_CORE` 下 `#include "sqlite3.h"`，而 mattn/go-sqlite3 只带 `sqlite3-binding.h` | 脚本生成**构建输入头**目录（`solo/.build-headers/`），不进源码树 |
 | DuckDB 预编译静态库是 GCC/libstdc++ ABI（LLVM-MinGW 只有 libc++，链不通） | 用 **GCC 系工具链**（msys2 UCRT64 / WinLibs）——工具链选对即可，**不需删任何代码** |
 
-> 早期曾以“脚本化剥离（补丁删掉 DuckDB / 数据分析 / 表格摘要）”为默认。**2026-09-12 实验推翻**：仅因工具链选错。
-> 实测（全新数据目录）：零补丁 **248.5MB / 2.39s / 237MB**；剥离版 202.6MB / 1.64s / 213.8MB——只省 46MB+23MB，却要每版刷补丁并丢掉**问数**能力。故降级为可选。
+> 早期曾以“脚本化剥离（删掉 DuckDB / 数据分析 / 表格摘要）”为默认。**2026-09-12 实验推翻**：仅因工具链选错。
+> 实测（全新数据目录）：零补丁 **248.5MB / 2.39s / 237MB**；剥离版 202.6MB / 1.64s / 213.8MB——只省 46MB+23MB，却要每版刷代码并丢掉**问数**能力。故剥离方案退役。
 
 ## 目录
 
 ```
 solo/
-  README.md                   本文件（车道说明 + 升级流程）
-  patches/0001-rerank-in-hybrid-search.patch   【默认启用】能力补丁：hybrid-search 支持 enable_rerank
-  patches/0002-data-analysis-endpoints.patch  【默认启用】能力补丁：问数执行 + 表格元信息端点（无 agent）
-  patches/0003-duckdb-bounded-extension-install.patch  【默认启用】健壮性补丁：DuckDB 扩展安装有界化（离线不再卡启动）
-  patches-optional/0001-strip-stage1.patch     【--with-strip 才启用】体积补丁（DuckDB/数据分析/表格摘要）
-  scripts/build-windows.sh    Windows/amd64 构建（应用补丁 → 生成 sqlite3.h → 编译）
+  README.md                    本文件（车道说明 + 同步流程）
+  scripts/build-windows.sh     Windows/amd64 构建（生成头 shim → CGO 编译；直接构建当前分支）
 .github/workflows/solo-lite-windows.yml   CI：windows-latest 出活 + SHA256
 ```
 
@@ -38,45 +58,35 @@ solo/
 
 ```bash
 # 本机（Windows，Git Bash 或 msys2）：
-bash solo/scripts/build-windows.sh                 # 上游 tag + patches/ → dist/WeKnora-lite.exe
-bash solo/scripts/build-windows.sh --no-patches     # 纯上游原版（对照/验证用）
-bash solo/scripts/build-windows.sh --with-strip     # 额外剥离能力（体积应急）
+bash solo/scripts/build-windows.sh                 # 当前分支 HEAD → dist/WeKnora-lite.exe
 bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号表）
+
+# 纯上游对照（不切分支即可）：git worktree add /tmp/upstream origin/main && cd /tmp/upstream && bash <本脚本>
 ```
 
 工具链发现顺序：`MINGW_BIN` 环境变量 → `PATH` 上的 `gcc`。CI 用 msys2 `UCRT64`。
 
-产物纪律：每个发布物记录 **上游 tag + 本车道 commit + 启用补丁清单 + 构建命令 + SHA256 + 许可清单**。
+产物纪律：每个发布物记录 **上游基线 SHA + 本车道分支 SHA + 构建命令 + SHA256 + 许可清单**。
 
-## 补丁策略（能力补丁默认启用 / 体积补丁可选）
-
-**边界铁律（ADR-0019 D-16）**：引擎已具备的能力一律由引擎提供，宿主**不自建**。当上游只把能力藏在「内置 Agent」里、未暴露成独立端点时，我们的动作是**改造引擎**（能力端点化），而不是在宿主重写一份。
-
-- `patches/`（默认启用）：**能力补丁**——附加式、每项对应一个上游 PR/Issue，上游合并后即删。当前：
-  - `0001-rerank-in-hybrid-search.patch`：`SearchParams.enable_rerank` + `HybridSearch` 在融合后调用 tenant 配置的 rerank 模型（含单测 5 例；失败回退融合顺序）。
-  - `0002-data-analysis-endpoints.patch`：`POST /knowledge/:id/data-analysis`（只读 SQL 执行）与 `GET /knowledge/:id/data-schema`（表元信息），复用内置 Agent 的 `data_analysis`/`data_schema` 工具实现；含 handler 单测 4 例 + 路由能力断言更新。
-  - `0003-duckdb-bounded-extension-install.patch`：`NewDuckDB()` 的扩展准备改为**离线优先 + 探活门控**（先 `LOAD`，已装/预置零网络；缺失时先 3s HTTPS 探活 `extensions.duckdb.org`，探不通直接跳过安装；探通才 `INSTALL`，`autoinstall` 关掉以免 LOAD 隐式联网；总预算默认 60s，`DUCKDB_EXTENSION_TIMEOUT_SECONDS` 可调，探活被墙可用 `DUCKDB_FORCE_EXTENSION_INSTALL=1` 绕过）。原因：无外网环境原会**卡死启动**（不报错、不监听端口），实测 **ctx 超时管不住 DuckDB 自己的下载重试**（黑洞网络下 INSTALL 独自烧 ~81s；且 TCP 探活会被「接受连接后黑洞」的代理骗过，必须用 HTTPS）——把「能不能启动」交给部署者设 `DUCKDB_SKIP_EXTENSION_LOAD` 不可靠（2026-09-12 拍板）。实测：WSL 无 egress、不设任何开关 → DuckDB 初始化到 `Server is running` **3.3s** + `/health` 200。上游 PR 意图：启动路径不得依赖外部网络可达性。
-- `patches-optional/`（`--with-strip` 才启用）：**体积补丁**——删除 Lite 不可达能力（DuckDB 数据分析工具/表格摘要任务/悬空 `data_schema`）。仅当体积/内存成为发布阻塞时用；与能力无关（剥离后问数、rerank 走引擎新端点，不受影响）。
-
-## 升级流程（上游出新 tag 时）
+## 上游同步流程（上游出新 tag/推进 main 时）
 
 ```bash
-git fetch origin --tags                    # origin = 上游 Tencent/WeKnora
-git checkout -b solo-v0.9 origin/v0.9       # 基线：新 tag
-git checkout solo -- solo/ .github/workflows/solo-lite-windows.yml
-bash solo/scripts/build-windows.sh          # 自动应用 patches/；冲突则显式报错退出
+git fetch origin --tags                 # origin = 上游 Tencent/WeKnora
+git checkout solo
+git merge origin/main                   # 冲突一次解决（这就是退役 patch 车道的主要收益）
+go build ./... && go test ./internal/... # 车道自检（含新增端点/健壮性用例）
+git push fork-ssh solo
 ```
 
-- `patches/` 是**附加式小补丁**（当前 12 文件 / ~+570 行），每项都有对应上游 PR；上游合并后补丁退役 ⇒ 冲突面随时间收敛。
-- 若 `git apply --check` 失败，脚本**立即报错退出**（不静默兜底）：用 `git apply --3way` 解决冲突后**重新生成补丁**（注意：生成的 patch 必须是 **LF** 行尾——用 PowerShell `Set-Content` 可能写成 CRLF 导致应用失败，建议 `git diff ... > patch`）。
-- 基线升级后必须：两补丁在干净基线可依次应用 + `go build ./...` + 本车道单测（`TestApplyRerank*` / `TestData*`）+ `router` 包自检 + 产物冒烟。2026-09-12 从 `v0.8.0` 升到上游 `main` 时已完成上述全流程（0001 直接可用；0002 因 `router` 两文件漂移重新生成）。
-- 长期零维护路径：上游接受能力端点 PR（工具端点化 + `enable_rerank`）后，`patches/` 清空。
+- 冲突解决原则：**行为对齐上游**优先；我们的能力端点保持附加式（不改变上游既有语义）。
+- 每次同步后重跑约定：`go build ./...`、车道单测（`TestApplyRerank*` / `TestData*`）、`router` 包自检、产物冒烟（`EDITION=lite` 出活 + `--version`）。
+- 上游接受对应 PR 后：rebase/merge 会把这些 commit 自然吞掉（becomes empty），届时从本车道删除即可。
 
 ## 已知待办（能力端点化路线）
 
 目标形态：**宿主 Agent（唯一编排） + 引擎（无 agent 的纯能力面）**。
 
-- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排）；**问数端点** `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema`（E2/E3，DuckDB 执行与表格解析均在引擎）。
+- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排）；**问数端点** `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema`（DuckDB 执行与表格解析均在引擎）。
 - 宿主侧：`KbEnginePort` 收口端点；工具注册走已有 `agent.mastra.tool` 机制（`kb_search` / `kb_data_schema` / `kb_data_query`）；MCP 作为后续可选薄壳。宿主 Agent 只做“问题→只读 SQL”的规划与结果解释。
 - 待定：`POST /engine-tools/{tool}` 通用工具端点（E5，仅在出现第二消费方时推进）。
 - 许可清单随包（`scripts/copy-licenses.sh`）与发布物装配（Solo 侧 W5）。
