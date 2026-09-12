@@ -1,8 +1,16 @@
 diff --git a/internal/application/service/knowledgebase_search.go b/internal/application/service/knowledgebase_search.go
-index c4f7510..8a0be0b 100644
+index cca50c9..e8239cf 100644
 --- a/internal/application/service/knowledgebase_search.go
 +++ b/internal/application/service/knowledgebase_search.go
-@@ -266,7 +266,66 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
+@@ -3,6 +3,7 @@ package service
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+ 	apperrors "github.com/Tencent/WeKnora/internal/errors"
+@@ -297,7 +298,87 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
  		deduplicatedChunks = deduplicatedChunks[:params.MatchCount]
  	}
  
@@ -39,7 +47,7 @@ index c4f7510..8a0be0b 100644
 +	}
 +	passages := make([]string, topK)
 +	for i := range topK {
-+		passages[i] = results[i].Content
++		passages[i] = rerankPassage(results[i])
 +	}
 +	ranked, err := reranker.Rerank(ctx, query, passages)
 +	if err != nil {
@@ -67,21 +75,43 @@ index c4f7510..8a0be0b 100644
 +		}
 +	}
 +	return append(reordered, results[topK:]...)
++}
++
++// rerankPassage builds the text handed to the rerank model: the knowledge title
++// (when known) followed by the chunk content.
++//
++// Why the title: chunk bodies routinely omit the document identity, so a
++// title-shaped query has nothing to match against once the title is dropped —
++// reranking then pushes a correctly retrieved document below lower-quality
++// neighbours (measured: title-probe MRR 1.00 -> 0.50 on a 27-document corpus).
++// Message search carries no title and keeps its plain content passage.
++func rerankPassage(result *types.SearchResult) string {
++	title := strings.TrimSpace(result.KnowledgeTitle)
++	content := strings.TrimSpace(result.Content)
++	switch {
++	case title == "":
++		return result.Content
++	case content == "":
++		return title
++	default:
++		return title + "\n" + content
++	}
  }
  
  // normalizedMatchCount resolves the effective primary-match cap for a search.
 diff --git a/internal/application/service/knowledgebase_search_rerank_test.go b/internal/application/service/knowledgebase_search_rerank_test.go
 new file mode 100644
-index 0000000..cf9f74d
+index 0000000..91c146a
 --- /dev/null
 +++ b/internal/application/service/knowledgebase_search_rerank_test.go
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,179 @@
 +package service
 +
 +import (
 +	"context"
 +	"fmt"
 +	"sort"
++	"strings"
 +	"testing"
 +
 +	"github.com/Tencent/WeKnora/internal/models/rerank"
@@ -110,9 +140,12 @@ index 0000000..cf9f74d
 +type fakeReranker struct {
 +	scores []float64
 +	err    error
++	// seen captures the passages handed to the model (passage-construction assertions).
++	seen []string
 +}
 +
 +func (f *fakeReranker) Rerank(_ context.Context, _ string, documents []string) ([]rerank.RankResult, error) {
++	f.seen = append([]string(nil), documents...)
 +	if f.err != nil {
 +		return nil, f.err
 +	}
@@ -158,6 +191,27 @@ index 0000000..cf9f74d
 +		if got[i].Content != w {
 +			t.Fatalf("position %d: got %q, want %q (full: %v)", i, got[i].Content, w, contentsOf(got))
 +		}
++	}
++}
++
++func TestApplyRerank_PassageIncludesKnowledgeTitle(t *testing.T) {
++	model := &fakeReranker{scores: []float64{0.9, 0.9}}
++	svc := newKBSvcForValidate(&fakeRerankModelService{model: model})
++	results := []*types.SearchResult{
++		{KnowledgeTitle: "影子灰度策略", Content: "先让一小部分流量走新链路。"},
++		{Content: "无标题片段"},
++	}
++
++	svc.applyRerank(context.Background(), &types.RetrievalConfig{RerankModelID: "r1"}, "影子灰度策略", results)
++
++	if len(model.seen) != 2 {
++		t.Fatalf("expected 2 passages, got %d: %v", len(model.seen), model.seen)
++	}
++	if !strings.Contains(model.seen[0], "影子灰度策略") || !strings.Contains(model.seen[0], "先让一小部分流量走新链路") {
++		t.Fatalf("passage must carry title + content, got %q", model.seen[0])
++	}
++	if model.seen[1] != "无标题片段" {
++		t.Fatalf("titleless passage must pass through unchanged, got %q", model.seen[1])
 +	}
 +}
 +
