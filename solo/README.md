@@ -2,7 +2,9 @@
 
 本目录是 **Solo 产品线对上游 WeKnora 的唯一增量**，且**只做构建、不改码**：上游源文件**零改动**（补丁仅在显式 `--with-patches` 时可选启用），所有差异以 **构建脚本 + CI** 形式存放于此。
 
-- 上游基线：`Tencent/WeKnora` tag **`v0.8.0`**（远端 `origin`；fork：`qiuchengw/WeKnora`，远端 `fork`，车道分支：`solo`）
+- 上游基线：`Tencent/WeKnora`（远端 `origin`；fork：`qiuchengw/WeKnora`，远端 `fork`，车道分支：`solo`）
+  - **当前基线 = 上游 `main` 合并点**（`2122a75`，2026-09-12 用户在 fork 侧同步；本地车道合并为 `d3a0113`）。历史基线 `v0.8.0`（tag）已升级。
+  - 发布物仍按**具体 commit SHA**记录（main 是移动目标；升级后重跑补丁验证与 golden）
 - 决策依据：`solo` 仓库 `docs/adr/0019-kb-engine-externalization.md`（D-13 构建来源纪律、**D-15 零补丁 canonical**、D-16 问数归属）
 - 形态：**单进程无头服务**（`cmd/server`，`EDITION=lite`），由 Solo 宿主 spawn 一个子进程，走 `127.0.0.1 + token`。
 
@@ -63,8 +65,9 @@ git checkout solo -- solo/ .github/workflows/solo-lite-windows.yml
 bash solo/scripts/build-windows.sh          # 自动应用 patches/；冲突则显式报错退出
 ```
 
-- `patches/` 是**附加式小补丁**（当前 3 文件 / +220 行），每项都有对应上游 PR；上游合并后补丁退役 ⇒ 冲突面随时间收敛。
-- 若 `git apply --check` 失败，脚本**立即报错退出**（不静默兜底）：用 `git apply --3way` 刷新补丁。
+- `patches/` 是**附加式小补丁**（当前 12 文件 / ~+570 行），每项都有对应上游 PR；上游合并后补丁退役 ⇒ 冲突面随时间收敛。
+- 若 `git apply --check` 失败，脚本**立即报错退出**（不静默兜底）：用 `git apply --3way` 解决冲突后**重新生成补丁**（注意：生成的 patch 必须是 **LF** 行尾——用 PowerShell `Set-Content` 可能写成 CRLF 导致应用失败，建议 `git diff ... > patch`）。
+- 基线升级后必须：两补丁在干净基线可依次应用 + `go build ./...` + 本车道单测（`TestApplyRerank*` / `TestData*`）+ `router` 包自检 + 产物冒烟。2026-09-12 从 `v0.8.0` 升到上游 `main` 时已完成上述全流程（0001 直接可用；0002 因 `router` 两文件漂移重新生成）。
 - 长期零维护路径：上游接受能力端点 PR（工具端点化 + `enable_rerank`）后，`patches/` 清空。
 
 ## 已知待办（能力端点化路线）

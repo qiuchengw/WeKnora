@@ -122,10 +122,10 @@ index 0000000..876f76f
 +	return tool.Execute(ctx, args)
 +}
 diff --git a/internal/container/container.go b/internal/container/container.go
-index 19230a1..976e07a 100644
+index da74bcd..a8511d3 100644
 --- a/internal/container/container.go
 +++ b/internal/container/container.go
-@@ -211,6 +211,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
+@@ -212,6 +212,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
  	must(container.Provide(service.NewKnowledgeService))
  	must(container.Provide(service.NewSpanTracker))
  	must(container.Provide(service.NewChunkService))
@@ -133,7 +133,7 @@ index 19230a1..976e07a 100644
  	must(container.Provide(service.NewKnowledgeTagService))
  	must(container.Provide(embedding.NewBatchEmbedder))
  	must(container.Provide(service.NewModelService))
-@@ -397,6 +398,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
+@@ -411,6 +412,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
  	must(container.Provide(handler.NewAuditLogHandler))
  	must(container.Provide(handler.NewKnowledgeBaseHandler))
  	must(container.Provide(handler.NewKnowledgeHandler))
@@ -343,7 +343,7 @@ index 0000000..46831f5
 +	}
 +}
 diff --git a/internal/router/router.go b/internal/router/router.go
-index 1e587b5..b6e01b2 100644
+index c8918dc..8effd86 100644
 --- a/internal/router/router.go
 +++ b/internal/router/router.go
 @@ -42,6 +42,7 @@ type RouterParams struct {
@@ -354,8 +354,8 @@ index 1e587b5..b6e01b2 100644
  	TenantHandler                *handler.TenantHandler
  	TenantService                interfaces.TenantService
  	TenantAPIKeyService          interfaces.TenantAPIKeyService
-@@ -259,7 +260,7 @@ func NewRouter(params RouterParams) *gin.Engine {
- 			params.ResourceCatalog,
+@@ -273,7 +274,7 @@ func NewRouter(params RouterParams) *gin.Engine {
+ 			params.KnowledgeService,
  		)
  		RegisterKnowledgeTagRoutes(v1, params.TagHandler, rbacGuards)
 -		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, rbacGuards)
@@ -364,7 +364,7 @@ index 1e587b5..b6e01b2 100644
  		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)
  		RegisterSessionRoutes(v1, params.SessionHandler, params.MessageSuggestionHandler, rbacGuards)
 diff --git a/internal/router/router_api_key_capabilities_test.go b/internal/router/router_api_key_capabilities_test.go
-index 6fa54a4..90c164e 100644
+index 5c604c7..9a43baa 100644
 --- a/internal/router/router_api_key_capabilities_test.go
 +++ b/internal/router/router_api_key_capabilities_test.go
 @@ -292,7 +292,7 @@ func TestKnowledgeReadRoutesDeclareRetrieveCapability(t *testing.T) {
@@ -385,7 +385,7 @@ index 6fa54a4..90c164e 100644
  		{http.MethodPost, "/api/v1/knowledge-bases/:id/faq/search"},
  		{http.MethodGet, "/api/v1/knowledge-bases/:id/tags"},
  		{http.MethodPost, "/api/v1/knowledge-search"},
-@@ -590,7 +592,7 @@ func TestKnowledgeBatchWriteRoutesDeclareIngestCapability(t *testing.T) {
+@@ -594,7 +596,7 @@ func TestKnowledgeBatchWriteRoutesDeclareIngestCapability(t *testing.T) {
  	g := &rbacGuards{}
  	v1 := gin.New().Group("/api/v1")
  
@@ -408,13 +408,13 @@ index 0d0438a..751e9cb 100644
  }
  
 diff --git a/internal/router/routes_knowledge.go b/internal/router/routes_knowledge.go
-index dc11aa4..7b07984 100644
+index e5a3051..af29c92 100644
 --- a/internal/router/routes_knowledge.go
 +++ b/internal/router/routes_knowledge.go
 @@ -64,7 +64,7 @@ func RegisterChunkRoutes(r *gin.RouterGroup, handler *handler.ChunkHandler, g *r
  // reuse OwnedKBOrAdmin because the URL :id is the KB id directly.
- // Cross-:id batch operations stay Contributor-gated — they don't have
- // a single owning KB to check against.
+ // Body-scoped batch operations have a Contributor route gate and resolve
+ // their KB ownership plus Editor operation grant inside the handler.
 -func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, g *rbacGuards) {
 +func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler, dataQueryHandler *handler.KnowledgeDataQueryHandler, g *rbacGuards) {
  	// 知识库下的知识路由组（URL :id is the KB id）。Scoped API key 需要
