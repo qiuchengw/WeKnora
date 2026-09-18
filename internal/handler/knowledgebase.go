@@ -373,7 +373,7 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 		secutils.SanitizeForLog(id), len(results))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    rewriter.CopyReferences(ctx, results),
+		"data":    projectHybridSearchResults(rewriter.CopyReferences(ctx, results)),
 	})
 }
 
