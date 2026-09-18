@@ -33,6 +33,18 @@
 | `2d558e4` | DuckDB 扩展安装**离线优先 + 探活门控**（无外网不再卡启动） | 健壮性（上游 PR 候选） |
 | `976bb5b` | `hybrid-search` 响应**回传 `content_revision`**（引用回链四件套齐备；新增响应投影，内部 `json:"-"` 语义与存储载荷不变） | 能力修复（上游 PR 候选） |
 
+### 上游同步记录（2026-09-18）
+
+- 同步到上游 `aaec920a`（**80 commit / 1115 文件**），**文本合并零冲突**；但**编译不过**：
+  上游把 `internal/agent/tools.DataAnalysisInput.Sql` 改名为 `SQL`，而车道 `internal/application/service/knowledge_data_query.go`
+  仍在用旧字段名 ⇒ 同一变更集内跟随上游命名修好（JSON 键仍是 `sql`，对外契约不变）。
+  **教训（写进纪律）**：**文本合并不冲突 ≠ 能编译**；每次同步必须跑 `go build ./...` + 关键包 `go test`，
+  不能只看 `git merge` 的退出码。
+- 上游自带 17 个失败用例（`internal/handler` 2 + `internal/application/service` 15），**在 pristine 上游 worktree 上同样失败**
+  （Windows 执行位 / docker / python CLI / AES key / fork 脚本 / ZIP 权限等环境相关）⇒ 与本车道无关，按指纹登记、不逐个诊断。
+- 车道净增（相对上游）：15 文件 / +861 行 —— E1 passage enrichment、`enable_rerank`、问数端点、DuckDB 离线优先、`content_revision` 投影。
+  上游**已自行实现**「问数工具」与 `DUCKDB_SKIP_EXTENSION_LOAD` 开关，但**没有**我们的能力端点与投影 ⇒ 车道内容仍全部独有。
+
 ## 为什么需要本车道（但源码改动很少）
 
 上游 Lite 目标在 Linux 上可零改码构建，Windows 上需要**两个构建期适配**（均不改源码）：
@@ -73,14 +85,18 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 
 ```bash
 git fetch origin --tags                 # origin = 上游 Tencent/WeKnora
+git fetch origin '+refs/heads/main:refs/remotes/origin/main'   # 本仓 origin 只配了 tag refspec ⇒ main 要显式抓
 git checkout solo
 git merge origin/main                   # 冲突一次解决（这就是退役 patch 车道的主要收益）
 go build ./... && go test ./internal/... # 车道自检（含新增端点/健壮性用例）
 git push fork-ssh solo
 ```
 
+- **必跑编译再判定同步成功**（2026-09-18 实测：80 commit 合并零冲突，却因上游字段改名编译失败）。
 - 冲突解决原则：**行为对齐上游**优先；我们的能力端点保持附加式（不改变上游既有语义）。
-- 每次同步后重跑约定：`go build ./...`、车道单测（`TestApplyRerank*` / `TestData*`）、`router` 包自检、产物冒烟（`EDITION=lite` 出活 + `--version`）。
+- 每次同步后重跑约定：`go build ./...`、车道单测（`TestApplyRerank*` / `TestData*` / 投影 4 例）、`router` 包自检、产物冒烟（`EDITION=lite` 出活 + `/health`）。
+- **版本口径**：产物/平台版本（x.y.z，`--engine-version`）与二进制自报版本由构建脚本**强制对齐**（`KB_ENGINE_VERSION` → 追加一条
+  同符号 `-X` 覆盖上游 `get_version.sh` 的 `VERSION` 文件值），构建末尾自带 `strings | grep -qx` 自证；上游 `VERSION` 文件保持不动（避免每次同步冲突）。
 - 上游接受对应 PR 后：rebase/merge 会把这些 commit 自然吞掉（becomes empty），届时从本车道删除即可。
 
 ## 已知待办（能力端点化路线）
