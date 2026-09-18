@@ -1385,6 +1385,9 @@ const processConfigLines = computed<string[]>(() => {
   if (o.asr_config?.enabled != null) lines.push(`${t(k('asr'))}: ${onOff(o.asr_config.enabled)}`)
 
   const qg = o.question_generation_config
+  if (o.summary_enabled != null) {
+    lines.push(`${t('uploadConfirm.documentSummary')}: ${onOff(o.summary_enabled)}`)
+  }
   if (qg?.enabled != null) {
     lines.push(`${t(k('question'))}: ${qg.enabled ? t(k('questionOn'), { n: qg.question_count ?? 3 }) : t(k('off'))}`)
   }
@@ -1614,7 +1617,9 @@ const processConfigLines = computed<string[]>(() => {
                       </span>
                     </div>
                     <span v-if="barOffsetPct(row.node) !== null && barOffsetMs(row.node) > 0"
-                      class="kp-bar-offset kp-mono" :style="{ left: barOffsetPct(row.node) + '%' }">
+                      class="kp-bar-offset kp-mono"
+                      :style="{ '--kp-offset-position': barOffsetPct(row.node) + '%' }"
+                      :title="'+' + formatDuration(barOffsetMs(row.node))">
                       +{{ formatDuration(barOffsetMs(row.node)) }}
                     </span>
                   </template>
@@ -1852,7 +1857,7 @@ const processConfigLines = computed<string[]>(() => {
 <style scoped lang="less">
 .kp-timeline {
   font-family: var(--app-font-family);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-primary);
   width: 100%;
   height: 100%;
@@ -1894,7 +1899,7 @@ const processConfigLines = computed<string[]>(() => {
   flex: 1;
   min-width: 0;
   margin: 0;
-  font-size: 15px;
+  font-size: var(--app-text-lg);
   font-weight: 600;
   line-height: 1.35;
   color: var(--td-text-color-primary);
@@ -1917,7 +1922,7 @@ const processConfigLines = computed<string[]>(() => {
   border-radius: var(--td-radius-medium);
   background: var(--td-warning-color-light);
   color: var(--td-warning-color);
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -1960,7 +1965,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-head-meta {
   margin: 8px 0 0;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
   color: var(--td-text-color-secondary);
   word-break: break-word;
@@ -1986,7 +1991,7 @@ const processConfigLines = computed<string[]>(() => {
   color: var(--td-text-color-placeholder);
   cursor: pointer;
   border-radius: var(--td-radius-default);
-  transition: background 150ms ease, color 150ms ease;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
 }
 
 .kp-icon-btn:hover:not(:disabled) {
@@ -2008,21 +2013,15 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-icon-btn-spin :deep(.t-icon) {
-  animation: kpSpin 0.9s linear infinite;
+  animation: wk-spin 0.9s linear infinite;
 }
 
 /* Slow rotation while auto-polling — visually distinct from the
    manual-refresh fast spin. Tells the user "refresh is happening on
    its own" without an extra label or badge. */
 .kp-icon-btn-autoflow :deep(.t-icon) {
-  animation: kpSpin 4s linear infinite;
+  animation: wk-spin 4s linear infinite;
   color: var(--td-warning-color);
-}
-
-@keyframes kpSpin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 .kp-meta-glyph {
@@ -2031,7 +2030,7 @@ const processConfigLines = computed<string[]>(() => {
   justify-content: center;
   width: 12px;
   height: 12px;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   line-height: 1;
 }
 
@@ -2070,11 +2069,11 @@ const processConfigLines = computed<string[]>(() => {
   border-radius: var(--td-radius-default);
   background: var(--td-bg-color-container);
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.4;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+  transition: background var(--app-motion-fast) ease, border-color var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
 }
 
 .kp-attempt:not(.kp-attempt-active):hover {
@@ -2102,7 +2101,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-attempt-num {
   font-weight: 600;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
 }
 
 .kp-attempt-glyph {
@@ -2135,7 +2134,7 @@ const processConfigLines = computed<string[]>(() => {
   gap: 8px;
   flex: 1 1 auto;
   padding: 56px 20px;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-placeholder);
 }
 
@@ -2170,7 +2169,7 @@ const processConfigLines = computed<string[]>(() => {
   flex-direction: column;
   align-items: center;
   transform: translateX(-50%);
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   color: var(--td-text-color-placeholder);
 }
 
@@ -2192,7 +2191,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-tick-label {
   margin-top: 2px;
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   letter-spacing: 0.02em;
 }
 
@@ -2210,7 +2209,7 @@ const processConfigLines = computed<string[]>(() => {
   cursor: pointer;
   position: relative;
   padding: 0 20px;
-  transition: background 150ms ease;
+  transition: background var(--app-motion-fast) ease;
 }
 
 .kp-row::before {
@@ -2222,7 +2221,7 @@ const processConfigLines = computed<string[]>(() => {
   width: 2px;
   background: transparent;
   border-radius: 0 2px 2px 0;
-  transition: background 150ms ease;
+  transition: background var(--app-motion-fast) ease;
 }
 
 .kp-row:hover {
@@ -2278,7 +2277,7 @@ const processConfigLines = computed<string[]>(() => {
   width: 22px;
   height: 22px;
   margin: -3px 0;
-  transition: color 120ms ease, background 150ms ease;
+  transition: color var(--app-motion-instant) ease, background var(--app-motion-fast) ease;
   flex-shrink: 0;
   border-radius: var(--td-radius-default);
 }
@@ -2305,7 +2304,7 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-name-text {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2314,17 +2313,17 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-name-mono {
   font-family: var(--app-font-family-mono);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
 }
 
 .kp-name-root {
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--app-text-md);
 }
 
 .kp-name-kind {
   font-family: var(--app-font-family-mono);
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--td-text-color-placeholder);
@@ -2335,7 +2334,7 @@ const processConfigLines = computed<string[]>(() => {
 
 /* Duration cell */
 .kp-cell-dur {
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-text-color-secondary);
   text-align: right;
   padding-right: 12px;
@@ -2408,13 +2407,13 @@ const processConfigLines = computed<string[]>(() => {
   transform: translateX(-50%);
   background: var(--td-text-color-primary);
   color: var(--td-text-color-anti);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   padding: 4px 8px;
   border-radius: var(--td-radius-default);
   white-space: nowrap;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 150ms ease;
+  transition: opacity var(--app-motion-fast) ease;
   z-index: 10;
   display: flex;
   align-items: center;
@@ -2522,7 +2521,7 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-bar-wrap-done {
-  border-color: rgba(7, 192, 95, 0.35);
+  border-color: color-mix(in srgb, var(--td-brand-color) 35%, transparent);
 }
 
 .kp-bar-wrap-failed {
@@ -2568,14 +2567,20 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-bar-offset {
   position: absolute;
-  bottom: -1px;
+  bottom: 0;
+  /* Keep the offset centered on its start time where space allows, then
+     clamp the label inside the chart instead of letting it cover duration. */
+  left: clamp(0px, calc(var(--kp-offset-position) - 45px), max(0px, calc(100% - 90px)));
+  width: min(90px, 100%);
+  line-height: 11px;
   font-size: 9px;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--td-text-color-placeholder);
-  pointer-events: none;
   white-space: nowrap;
-  transform: translateX(-50%);
   opacity: 0;
-  transition: opacity 150ms ease;
+  transition: opacity var(--app-motion-fast) ease;
 }
 
 .kp-row:hover .kp-bar-offset,
@@ -2678,19 +2683,19 @@ const processConfigLines = computed<string[]>(() => {
   background: var(--td-error-color);
   color: var(--td-text-color-anti);
   border-radius: 50%;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .kp-last-error-title {
   font-weight: 600;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-error-color);
 }
 
 .kp-last-error-code {
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   background: var(--td-error-color);
   color: var(--td-text-color-anti);
   padding: 1px 6px;
@@ -2699,13 +2704,13 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-last-error-suggestion {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-secondary);
   margin-bottom: 4px;
 }
 
 .kp-last-error-raw {
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-text-color-placeholder);
   white-space: pre-wrap;
   word-break: break-word;
@@ -2753,7 +2758,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-detail-name {
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2763,7 +2768,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-detail-kind {
   font-family: var(--app-font-family-mono);
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--td-text-color-placeholder);
@@ -2777,7 +2782,7 @@ const processConfigLines = computed<string[]>(() => {
   align-items: center;
   padding: 1px 8px;
   border-radius: var(--td-radius-default);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 500;
   background: var(--td-bg-color-component);
   color: var(--td-text-color-primary);
@@ -2838,10 +2843,10 @@ const processConfigLines = computed<string[]>(() => {
   border: none;
   background: transparent;
   color: var(--td-text-color-secondary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   cursor: pointer;
   position: relative;
-  transition: color 150ms ease;
+  transition: color var(--app-motion-fast) ease;
 }
 
 .kp-tab:hover {
@@ -2882,12 +2887,12 @@ const processConfigLines = computed<string[]>(() => {
   align-items: center;
   justify-content: center;
   padding: 48px 0;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-placeholder);
 }
 
 .kp-detail-hint {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-secondary);
   padding: 10px 12px;
   background: var(--td-bg-color-secondarycontainer);
@@ -2903,7 +2908,7 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-section-title {
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -2912,7 +2917,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-section-desc {
   margin: 4px 0 8px;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
   color: var(--td-text-color-placeholder);
 }
@@ -2931,11 +2936,11 @@ const processConfigLines = computed<string[]>(() => {
   border: 1px solid var(--td-component-border);
   background: var(--td-bg-color-container);
   color: var(--td-text-color-secondary);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   padding: 3px 8px;
   border-radius: var(--td-radius-default);
   cursor: pointer;
-  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease, border-color var(--app-motion-fast) ease;
 }
 
 .kp-section-action:hover {
@@ -2964,7 +2969,7 @@ const processConfigLines = computed<string[]>(() => {
   grid-template-columns: 130px 1fr;
   gap: 12px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   min-width: 0;
   padding: 8px 12px;
   background: var(--td-bg-color-container);
@@ -2980,7 +2985,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-kv-key {
   color: var(--td-text-color-secondary);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -3017,14 +3022,14 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-kv-scalar {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
 }
 
 .kp-kv-running {
   color: var(--td-warning-color);
   font-style: italic;
   font-family: var(--app-font-family);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
 }
 
 .kp-kv-tag-live {
@@ -3062,7 +3067,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-mono {
   font-family: var(--app-font-family-mono);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   letter-spacing: 0;
 }
 
@@ -3094,7 +3099,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-kv-summary-static {
   color: var(--td-text-color-placeholder);
-  font-size: 11px;
+  font-size: var(--app-text-xs);
 }
 
 .kp-kv-toggle {
@@ -3107,7 +3112,7 @@ const processConfigLines = computed<string[]>(() => {
   align-items: baseline;
   gap: 8px;
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   flex-wrap: wrap;
 }
 
@@ -3116,7 +3121,7 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-kv-toggle-label {
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-brand-color);
   font-weight: 500;
 }
@@ -3141,7 +3146,7 @@ const processConfigLines = computed<string[]>(() => {
   grid-template-columns: 110px 1fr 64px;
   gap: 10px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
 }
 
 .kp-breakdown-label {
@@ -3203,20 +3208,20 @@ const processConfigLines = computed<string[]>(() => {
   background: var(--td-error-color);
   color: var(--td-text-color-anti);
   border-radius: 50%;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .kp-error-title {
   font-weight: 600;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-error-color);
 }
 
 .kp-error-code {
   margin-left: auto;
-  font-size: 10px;
+  font-size: var(--app-text-2xs);
   background: var(--td-error-color);
   color: var(--td-text-color-anti);
   padding: 1px 6px;
@@ -3225,7 +3230,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-error-msg {
   margin: 0;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-text-color-secondary);
   white-space: pre-wrap;
   word-break: break-word;
@@ -3248,7 +3253,7 @@ const processConfigLines = computed<string[]>(() => {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-text-color-primary);
   line-height: 1.6;
 }
@@ -3279,7 +3284,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-compact-caption {
   margin-top: 4px;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -3301,13 +3306,13 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-proccfg-title {
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-primary);
   margin-bottom: 2px;
 }
 
 .kp-proccfg-line {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.6;
   color: var(--td-text-color-secondary);
   word-break: break-word;

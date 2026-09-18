@@ -421,6 +421,21 @@ func (e *AgentEngine) analyzeResponse(
 			"answer_len": len(response.Content),
 		})
 
+		// An empty natural stop is retryable (the caller nudges the model and
+		// runs another round), so it must not emit any terminal answer event
+		// yet: downstream consumers treat a Done=true EventAgentFinalAnswer as
+		// "the answer is finished" and would finalize (or cancel) while the
+		// retry is still running (#2906). When retries are exhausted the
+		// caller emits the fallback as the sole terminal answer.
+		if response.Content == "" {
+			return responseVerdict{
+				isDone:       true,
+				finalAnswer:  "",
+				emptyContent: true,
+				step:         step,
+			}
+		}
+
 		// Emit the final answer. The answer text reaches the UI by one of two
 		// paths:
 		//   (a) Already streamed live during the think phase — the common case
@@ -456,7 +471,7 @@ func (e *AgentEngine) analyzeResponse(
 		return responseVerdict{
 			isDone:       true,
 			finalAnswer:  response.Content,
-			emptyContent: response.Content == "",
+			emptyContent: false,
 			step:         step,
 			answerID:     answerID,
 		}
@@ -507,6 +522,7 @@ func buildRuntimeContextBlock(
 	sessionID string,
 	kbs []*KnowledgeBaseInfo,
 	docs []*SelectedDocumentInfo,
+	origin *QuestionOriginInfo,
 ) string {
 	var sb strings.Builder
 	sb.WriteString("<runtime_context scope=\"this_turn\">\n")
@@ -549,8 +565,38 @@ func buildRuntimeContextBlock(
 		sb.WriteString("  </pinned_documents>\n")
 	}
 
+	writeQuestionOrigin(&sb, origin)
+
 	sb.WriteString("</runtime_context>")
 	return sb.String()
+}
+
+// writeQuestionOrigin tells the model which source a picked suggested
+// question came from. Such a question is phrased from one document's
+// content, so it can read like general knowledge ("why be careful comparing
+// graphs?") while meaning something specific to that document; without the
+// hint the model may answer from memory without searching at all.
+func writeQuestionOrigin(sb *strings.Builder, origin *QuestionOriginInfo) {
+	if origin == nil || origin.KnowledgeBaseID == "" {
+		return
+	}
+	fmt.Fprintf(sb, "  <question_origin knowledge_base_id=\"%s\"", escapeXMLAttr(origin.KnowledgeBaseID))
+	if origin.KnowledgeBaseName != "" {
+		fmt.Fprintf(sb, " name=\"%s\"", escapeXMLAttr(origin.KnowledgeBaseName))
+	}
+	sb.WriteString(">\n")
+	if d := origin.Document; d != nil && d.KnowledgeID != "" {
+		title := d.Title
+		if title == "" {
+			title = d.FileName
+		}
+		fmt.Fprintf(sb, "    <document knowledge_id=\"%s\" title=\"%s\" />\n",
+			escapeXMLAttr(d.KnowledgeID), escapeXMLAttr(title))
+	}
+	sb.WriteString("    <note>The user picked this question from suggestions generated from this source. " +
+		"Search it before answering: the question refers to that content even when it reads like " +
+		"general knowledge.</note>\n")
+	sb.WriteString("  </question_origin>\n")
 }
 
 // buildMustUseBlock emits a short per-turn hint when the user @mentioned MCP/Skill.
@@ -675,7 +721,7 @@ func commonStringPrefix(a, b string) string {
 // not written to rendered_content / history.
 func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	e.registerRuntimeReferences()
-	runtimeCtx := buildRuntimeContextBlock(sessionID, e.knowledgeBasesInfo, e.selectedDocs)
+	runtimeCtx := buildRuntimeContextBlock(sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin)
 	runtimeCtx = e.modelContext.CompactKnownText(runtimeCtx)
 	mustUse := buildMustUseBlock(e.pinnedMCPServices, e.pinnedSkills)
 	return composeUserTurnContent(runtimeCtx, mustUse, query)
@@ -715,6 +761,12 @@ func (e *AgentEngine) registerRuntimeReferences() {
 		}
 		e.modelContext.RegisterDocument(doc.KnowledgeID)
 		e.modelContext.RegisterKnowledgeBase(doc.KnowledgeBaseID)
+	}
+	if origin := e.questionOrigin; origin != nil {
+		e.modelContext.RegisterKnowledgeBase(origin.KnowledgeBaseID)
+		if origin.Document != nil {
+			e.modelContext.RegisterDocument(origin.Document.KnowledgeID)
+		}
 	}
 }
 
@@ -841,14 +893,18 @@ func countTotalToolCalls(steps []types.AgentStep) int {
 // may become stale across turns (KB can be switched, updated, or deleted).
 // Historical results from these tools are redacted to force fresh retrieval.
 var kbToolNames = map[string]bool{
-	agenttools.ToolKnowledgeSearch:     true,
-	agenttools.ToolGrepChunks:          true,
-	agenttools.ToolListKnowledgeChunks: true,
+	agenttools.ToolSearchKnowledge:     true,
+	agenttools.ToolReadDocument:        true,
+	agenttools.ToolListDocuments:       true,
 	agenttools.ToolQueryKnowledgeGraph: true,
-	agenttools.ToolGetDocumentInfo:     true,
 	agenttools.ToolWikiSearch:          true,
 	agenttools.ToolWikiReadPage:        true,
-	agenttools.ToolWikiReadSourceDoc:   true,
+	// Retired names still appear in stored histories.
+	agenttools.LegacyToolKnowledgeSearch:     true,
+	agenttools.LegacyToolGrepChunks:          true,
+	agenttools.LegacyToolListKnowledgeChunks: true,
+	agenttools.LegacyToolGetDocumentInfo:     true,
+	agenttools.LegacyToolWikiReadSourceDoc:   true,
 }
 
 // redactHistoryKBResults replaces full KB tool results in historical context

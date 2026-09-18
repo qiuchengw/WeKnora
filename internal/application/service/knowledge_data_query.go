@@ -108,7 +108,9 @@ func (s *knowledgeDataQueryService) DataAnalysis(ctx context.Context, knowledgeI
 		// an internal failure; the handler maps it to 400.
 		return nil, fmt.Errorf("document %s cannot be loaded for analysis: %w", knowledgeID, err)
 	}
-	args, err := json.Marshal(tools.DataAnalysisInput{KnowledgeID: knowledgeID, Sql: sqlText})
+	// 字段名跟随上游（`tools.DataAnalysisInput.SQL`；JSON 键仍是 `sql`）：上游已把同一能力收进主干，
+	// 车道这份是残留 ⇒ 用上游命名，避免"文本合并干净、编译才炸"的漂移（2026-09-18 同步实测）。
+	args, err := json.Marshal(tools.DataAnalysisInput{KnowledgeID: knowledgeID, SQL: sqlText})
 	if err != nil {
 		return nil, err
 	}
