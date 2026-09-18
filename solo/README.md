@@ -44,6 +44,11 @@
   （Windows 执行位 / docker / python CLI / AES key / fork 脚本 / ZIP 权限等环境相关）⇒ 与本车道无关，按指纹登记、不逐个诊断。
 - 车道净增（相对上游）：15 文件 / +861 行 —— E1 passage enrichment、`enable_rerank`、问数端点、DuckDB 离线优先、`content_revision` 投影。
   上游**已自行实现**「问数工具」与 `DUCKDB_SKIP_EXTENSION_LOAD` 开关，但**没有**我们的能力端点与投影 ⇒ 车道内容仍全部独有。
+- **产物事实（2026-09-18 构建，本机 WSL 原生构建）**：`kb-engine-0.8.3-linux-x64.tar.gz`（80.5 MB / `sha512 b9ca4adf…2a1bc`），
+  来源 = 本车道 HEAD `d21c72a4`（ldflags 内 `CommitID=d21c72a4` 可自证），二进制自报版本 **0.8.3**（与产物名一致）。
+- **升级迁移演练（本地 WSL，客户升级路径）**：旧产物（15 个迁移）在空目录建库 ⇒ `schema_migrations.version=14`；
+  换新产物（24 个迁移）在**同一数据目录**启动 ⇒ 自动迁移到 `version=23, dirty=0` 且 `/health` 200。
+  ⇒ 引擎升级会自动迁移客户库（`AUTO_MIGRATE` 缺省开），**发布前必须跑这条演练**；客户侧无备份动作，见 Solo 侧提案"升级前自动备份引擎库"。
 
 ## 为什么需要本车道（但源码改动很少）
 
