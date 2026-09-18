@@ -82,6 +82,26 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 # 纯上游对照（不切分支即可）：git worktree add /tmp/upstream origin/main && cd /tmp/upstream && bash <本脚本>
 ```
 
+## 本仓的 canonical 检出位置（2026-09-18 起）
+
+**canonical = Solo 主仓的子模块 `solo/packages/kb-engine-src`**（方案 A，拍板 2026-09-18）：
+
+- 为什么：产物必须能追溯到**确切的源码提交**（ADR-0019 D-13 的 provenance 要求）。子模块的 gitlink 把它变成
+  仓库事实（`git rev-parse HEAD` = 产物里的 `CommitID`），并且**消掉了发版脚本里写死的本机绝对路径**；
+- 远端约定（子模块内）：`origin` = fork（`git@github.com:qiuchengw/WeKnora.git`，推 `solo` 分支）；
+  `upstream` = `https://github.com/Tencent/WeKnora.git`（只拉上游）；
+- **两级提交**（引擎改动必须走完，否则主仓钉的还是旧提交）：
+  ```bash
+  cd <solo>/packages/kb-engine-src
+  git checkout solo && git merge upstream/main      # 需要同步上游时（先 git fetch upstream --tags）
+  go build ./... && go test ./internal/...          # 文本合并不冲突 ≠ 能编译（2026-09-18 实测）
+  git commit … && git push origin solo              # ① 车道提交推到 fork
+  cd <solo> && git add packages/kb-engine-src && git commit …   # ② 主仓提交新 gitlink
+  ```
+- 发版脚本（`solo/scripts/lib/release-kbengine.mjs`）缺省就用这个子模块，并在构建前**断言 gitlink 工作树干净**；
+  `--src` / `SOLO_KB_ENGINE_SRC` 仍可指到别处的检出（离线预检/对照构建）。
+- 原来的旁路检出（`E:\code\900bu\_thirdparty\weknora`）自此只是历史副本，不再被任何脚本使用。
+
 工具链发现顺序：`MINGW_BIN` 环境变量 → `PATH` 上的 `gcc`。CI 用 msys2 `UCRT64`。
 
 产物纪律：每个发布物记录 **上游基线 SHA + 本车道分支 SHA + 构建命令 + SHA256 + 许可清单**。
