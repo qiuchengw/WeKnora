@@ -31,6 +31,7 @@
 | `6364086` | `hybrid-search` 支持 `enable_rerank`（含单测；重排失败回退融合序） | 能力端点（上游 PR 候选） |
 | `bf2f05e` | 问数端点 `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema` | 能力端点（上游 PR 候选） |
 | `2d558e4` | DuckDB 扩展安装**离线优先 + 探活门控**（无外网不再卡启动） | 健壮性（上游 PR 候选） |
+| `976bb5b` | `hybrid-search` 响应**回传 `content_revision`**（引用回链四件套齐备；新增响应投影，内部 `json:"-"` 语义与存储载荷不变） | 能力修复（上游 PR 候选） |
 
 ## 为什么需要本车道（但源码改动很少）
 
