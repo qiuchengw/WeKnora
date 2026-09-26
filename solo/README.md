@@ -23,15 +23,20 @@
 - 保留的纪律：**一个 commit = 一个上游 PR 候选**（commit message 写明动机 + 实测证据），便于随时逐个提 PR；上游合并后对应 commit 自然成为空操作（rebase/merge 时消失）。
 - 纯上游对照构建：直接 `git checkout origin/main` 构建，不再需要 `--no-patches`。
 
-**车道当前内容（`git log origin/main..solo`）**：
+**车道当前内容（`git log upstream/main..solo`）**：
 
 | commit | 变更 | 性质 |
 |---|---|---|
-| `02d3ea5` | E1 passage enrichment（标题进入重排语料，修 title-blind rerank） | 能力修复（上游 PR 候选） |
-| `6364086` | `hybrid-search` 支持 `enable_rerank`（含单测；重排失败回退融合序） | 能力端点（上游 PR 候选） |
 | `bf2f05e` | 问数端点 `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema` | 能力端点（上游 PR 候选） |
-| `2d558e4` | DuckDB 扩展安装**离线优先 + 探活门控**（无外网不再卡启动） | 健壮性（上游 PR 候选） |
+| `2d558e4` | DuckDB 扩展安装**离线优先 + 探活门控**（无外网不再卡启动；与上游 `DUCKDB_SKIP_EXTENSION_LOAD` 并存：上游开关=显式逃生舱，车道=有界尝试） | 健壮性（上游 PR 候选） |
 | `976bb5b` | `hybrid-search` 响应**回传 `content_revision`**（引用回链四件套齐备；新增响应投影，内部 `json:"-"` 语义与存储载荷不变） | 能力修复（上游 PR 候选） |
+
+**已被上游收编（车道删除，2026-09-26 同步 `9fcc2c67`）**——这正是车道模型期望的结局（上游接 PR ⇒ 车道 commit 自然消失）：
+
+| 原车道 commit | 上游对应实现 | 车道侧动作 |
+|---|---|---|
+| `02d3ea5` E1 passage enrichment（标题进入重排语料，修 title-blind rerank） | `internal/reranking/passage.go` 的 `ModelPassage`（`标题 + "\n\n" + 正文`，注释同样以 "Show HN: Echo …" 为例）+ `rerank_test.go:TestModelPassage_prefixesDocumentTitle` | 删车道 `rerankPassage`/`applyRerank`（整文件取上游） |
+| `6364086` `hybrid-search` 支持 `enable_rerank`（失败回退融合序） | `types.RerankOptions`（`rerank` 对象；**hybrid-search 上缺席 = 不重排**）+ `knowledgebase_search_rerank.go:HybridSearchWithRerank` + `meta.rerank` 诊断（模型解析/阈值/降级 outcome，比车道版更全） | 删 `types.SearchParams.EnableRerank`；**消费侧同批跟随**：Solo 主仓 `apps/solo-model-service` 检索请求改发 `rerank:{enabled:true}`（旧字段已不存在，继续发 = **静默失去重排**） |
 
 ### 上游同步记录（2026-09-18）
 
@@ -51,6 +56,31 @@
   换新产物在**同一数据目录**启动 ⇒ 必须自动迁移到新版本且 `/health` 200（`AUTO_MIGRATE` 缺省开）。
   **每次发版前必跑**；客户侧无备份动作 ⇒ Solo 侧已加「首次以新版本启动前自动备份引擎库」（见 model-service 需求 C3.12）。
 
+### 上游同步记录（2026-09-26）
+
+- 同步到上游 `9fcc2c67`（**186 commit / 1733 文件**，自上次合并点 `aaec920a`），**5 处文本冲突**
+  （冲突行 ≈**483 行**：`knowledgebase_search.go` ~95 · `knowledgebase_search_rerank_test.go` 整文件 add/add ~362 ·
+  `container.go` 4 · `handler/knowledgebase.go` 10 · `types/search.go` 12）。
+- **冲突解决口径 = 行为对齐上游 + 车道附加式**：两个文件（`knowledgebase_search.go`、
+  `knowledgebase_search_rerank_test.go`）**整体取上游** —— 上游已实现同一能力且更全（见上表「已被上游收编」）；
+  `types/search.go` 取上游 `Rerank *RerankOptions`；`handler/knowledgebase.go` 取上游新结构（`retrieval.Results`
+  + `meta.rerank`）**并重新贴回车道投影** `projectHybridSearchResults(...)`；`container.go` 两个 import 都留
+  （`net` 上游 + `net/http` 车道）。
+- **编译门禁：✓ 通过（129s）** —— `go build -tags sqlite_fts5 ./...` +
+  车道关键包测试（`internal/types` · `agent(/tools)` · `handler` · `application/service` 全 ok，-run 精确命中）。
+  产物冒烟：`EDITION=lite` 出活 **253M**（win32；上游 `VERSION=0.8.2`，发布时由 `KB_ENGINE_VERSION` 注入覆盖）。
+  **本次未出现 09-18 那种"合并不冲突但编译不过"**——被删的车道代码正是上游已收编的部分。
+- 车道净增（相对上游）：**3 项**（问数端点 · DuckDB 有界扩展安装 · `content_revision` 投影）；
+  原 5 项中的 2 项（E1 passage enrichment、`enable_rerank`）已随上游收编删除。
+- **消费侧同批跟随（跨仓，不可省）**：Solo 主仓 `apps/solo-model-service/src/kb/weknora/client.ts` 的检索请求
+  由 `enable_rerank` 改为 `rerank:{enabled:true}`（缺席=不重排），并读 `meta.rerank` 在降级时出声；
+  用例 `apps/solo-model-service/tests/kbEngineSearchRerank.test.ts`（3 例）钉住该口径；
+  `docs/requirements/引擎消费面.md` 的端点 6/内核表同批更新。
+- 上游自带失败用例（`handler` 2 + `application/service` 15 等环境相关）**不在车道门禁的 -run 集合内**，
+  按指纹登记、不逐个诊断（pristine 上游同样失败）。
+- 产物事实与升级迁移演练的纪律同 09-18 一节（发布侧唯一记录 / 发版前必跑迁移演练）；本次同步只做到
+  编译门禁与产物冒烟，**迁移演练在发版前执行**。
+
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
 > 与「产物事实」的分工：上方已拍板**产物事实只在发布侧记一处**（每构建就变的数字）；本台账记的是
@@ -66,6 +96,7 @@
 |---|---|---|---|---|---|
 | 2026-09-18 | `2122a75` → `aaec920a`（80 commit / 1115 文件） | 0（文本合并零冲突；**字段改名 SQL 编译错一处**，同变更集修） | ~1 | ✗（当时门禁未机械化——本次教训成文并催生本台账） | 见上方同步记录 |
 | 2026-09-22 | —（无同步；**门禁启用首跑**） | — | ~0.5 | ✓ `go build ./...` + 车道用例全绿（types/agent/agent.tools/handler/service，门禁 116s） | 阈值累计自此行开始 |
+| 2026-09-26 | `aaec920a` → `9fcc2c67`（186 commit / 1733 文件） | **≈483**（5 处：service 95 + 其测试 362 + container 4 + handler 10 + types 12；**其中 457 行是"上游已收编 ⇒ 整文件取上游"**，真需人工判断的仅 ~26 行） | ~1.5 | ✓ `go build ./...` + 车道用例全绿（129s）；产物冒烟 253M | 见上方同步记录；**车道净减 2 项**（E1/`enable_rerank` 被上游收编） |
 
 ## 为什么需要本车道（但源码改动很少）
 
@@ -125,13 +156,17 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 
 ## 上游同步流程（上游出新 tag/推进 main 时）
 
+> 远端命名以「本仓的 canonical 检出位置」一节为准：**`origin` = fork（`qiuchengw/WeKnora`，推 `solo`）**、
+> **`upstream` = `Tencent/WeKnora`（只拉）**。（下方命令里的旧名 `origin`/`fork-ssh` 是 2026-09-12 前的写法，已更正。）
+
 ```bash
-git fetch origin --tags                 # origin = 上游 Tencent/WeKnora
-git fetch origin '+refs/heads/main:refs/remotes/origin/main'   # 本仓 origin 只配了 tag refspec ⇒ main 要显式抓
+git fetch upstream --tags            # upstream = Tencent/WeKnora
 git checkout solo
-git merge origin/main                   # 冲突一次解决（这就是退役 patch 车道的主要收益）
+git merge upstream/main              # 冲突一次解决（这就是退役 patch 车道的主要收益）
 go build ./... && go test ./internal/... # 车道自检（含新增端点/健壮性用例）
-git push fork-ssh solo
+# 或直接跑机械化门禁（推荐，含 tags 与 -run 精确命中）：Solo 主仓
+#   bash scripts/kb-engine/build-weknora-lite.sh --src <本子模块> --out <临时目录>
+git push origin solo                 # 推 fork（两级提交第①步）
 ```
 
 - **必跑编译再判定同步成功**（2026-09-18 实测：80 commit 合并零冲突，却因上游字段改名编译失败）。
