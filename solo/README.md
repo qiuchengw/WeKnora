@@ -87,6 +87,11 @@
   **判定口径 = 版本推进 + dirty=0 + 无 migration failed**：引擎的迁移失败**只 warn 不阻断启动**
   （`internal/container/container.go:893-911`），"进程起来了 / `/health` 200"本身**不构成证据**。
   机械化门禁 = Solo 主仓 `scripts/kb-engine/rehearse-upgrade.sh`（负例已验：新旧产物对调 ⇒ 降级触发迁移失败 ⇒ 退出码 1）。
+- **同批：客户机现场的迁移自检（Solo 侧，非本车道代码）**——演练只覆盖我方构建，客户机升级是"服务启动引擎时现场迁移"，
+  故 Solo 主仓 `apps/solo-model-service` 在**记录版本成功之前**断言 `GET /api/v1/system/info` 的
+  `db_version` / `db_migration_error`（**上游既有字段 ⇒ 本车道零补丁**）：失败/dirty ⇒ `engine_migration_failed`、
+  库版本 < 本产物 `migrations/sqlite` 最大版本 ⇒ `engine_migration_incomplete`，两者都不进入 ready 且不写
+  `engine-last-run.json`；installer `--doctor` 增 `service.kb-engine-schema` 只读转发该结论。
 
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
