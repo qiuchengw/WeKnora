@@ -602,14 +602,29 @@
             </div>
           </div>
 
-          <!-- 思考模式 -->
+          <!-- 思考强度：off / auto + 所选对话模型目录上报的等级 -->
           <div class="setting-row">
             <div class="setting-info">
               <label>{{ $t('agent.editor.thinking') }}</label>
               <p class="desc">{{ $t('agentEditor.desc.thinking') }}</p>
+              <p v-if="selectedChatModel && !selectedChatModelCanThink" class="desc">
+                {{ $t('agent.editor.reasoningEffortUnsupported') }}
+              </p>
+              <p v-else-if="selectedChatModelAlwaysThinks" class="desc">
+                {{ $t('agent.editor.reasoningEffortAlwaysOn') }}
+              </p>
             </div>
             <div class="setting-control">
-              <t-switch v-model="thinkingEnabled" />
+              <t-select v-model="reasoningEffortLevel" class="reasoning-effort-select"
+                :popup-props="{ overlayClassName: 'reasoning-level-select-popup' }">
+                <t-option v-for="level in reasoningEffortOptions" :key="level" :value="level"
+                  :label="$t(levelLabelKey(level))" :show-overflow-tooltip="false">
+                  <div class="reasoning-level-option">
+                    <span class="reasoning-level-option__title">{{ $t(levelLabelKey(level)) }}</span>
+                    <span class="reasoning-level-option__hint">{{ $t(levelDescriptionKey(level)) }}</span>
+                  </div>
+                </t-option>
+              </t-select>
             </div>
           </div>
 
@@ -846,9 +861,9 @@
         </div>
       </div>
 
-      <!-- 多轮对话。Agent 模式下 history_turns 同样生效（session_agent_qa.go
-           经 LoadAgentHistory 读取），所以本组不再整体按模式隐藏；开关本身仍由
-           EnsureDefaults 强制开启，故只在普通模式展示。 -->
+      <!-- 多轮对话。两种模式都保留本组：Agent 模式在这里说明历史按上下文窗口
+           自动管理，并承载跨轮保留检索结果；开关由 EnsureDefaults 强制开启，
+           故只在普通模式展示。 -->
       <div v-show="currentSection === 'conversation'" class="section">
         <div class="section-header">
           <h2>{{ $t('agent.editor.conversationSettings') }}</h2>
@@ -868,8 +883,9 @@
             </div>
           </div>
 
-          <!-- 保留轮数（Agent 模式恒为多轮，故不受开关状态影响） -->
-          <div v-if="formData.config.multi_turn_enabled || isAgentMode" class="setting-row">
+          <!-- 保留轮数（仅普通模式：Agent 模式按上下文窗口加载历史、超出时压缩成
+               摘要，见 session_agent_qa.go -> LoadAgentHistory，不读 history_turns） -->
+          <div v-if="!isAgentMode && formData.config.multi_turn_enabled" class="setting-row">
             <div class="setting-info">
               <label>{{ $t('agent.editor.historyTurns') }}</label>
               <p class="desc">{{ $t('agentEditor.desc.historyRounds') }}</p>
@@ -1249,11 +1265,11 @@
       <div v-show="currentSection === 'skills' && isAgentMode" class="section">
         <div class="section-header">
           <h2>{{ $t('agent.editor.skillsConfig') }}</h2>
-          <p class="section-description">{{ $t('agent.editor.skillsConfigDesc') }}</p>
+          <p class="section-description">{{ hostOnly ? $t('agent.editor.hostSkillsConfigDesc') : $t('agent.editor.skillsConfigDesc') }}</p>
         </div>
 
         <div class="settings-group">
-          <div class="setting-row">
+          <div v-if="!hostOnly" class="setting-row">
             <div class="setting-info">
               <label>{{ $t('agent.editor.sandboxBackend') }}</label>
               <p class="desc">{{ $t('agent.editor.sandboxBackendHint') }}</p>
@@ -1380,6 +1396,21 @@
                           <t-icon :name="skillStatusIcon(skill)" size="14px" />
                           {{ skillStatusHint(skill) }}
                         </span>
+                        <span
+                          v-if="skill.selectable && skill.servedNote"
+                          class="skill-pick__hint"
+                          :class="{ 'skill-pick__hint--busy': isSkillBusy(skill) }"
+                        >
+                          <t-icon :name="isSkillBusy(skill) ? 'refresh' : 'error-circle'" size="14px" />
+                          {{ skill.servedNote }}
+                        </span>
+                        <span
+                          v-if="canUpgradeSkillRow(skill)"
+                          class="skill-pick__hint skill-pick__hint--upgrade"
+                        >
+                          <t-icon name="arrow-up" size="14px" />
+                          {{ skillUpgradeHint(skill) }}
+                        </span>
                       </div>
                       <p
                         v-if="skill.description"
@@ -1393,13 +1424,24 @@
                       variant="text"
                       theme="primary"
                       :loading="installingCatalogId === skill.id"
-                      :title="$t('agent.editor.installToThisSandbox')"
+                      :title="installsAnUpgrade(skill) ? (hostOnly ? $t('agent.editor.hostUpgradeOnThisComputer') : $t('agent.editor.upgradeOnThisSandbox')) : (hostOnly ? $t('agent.editor.hostInstallToThisComputer') : $t('agent.editor.installToThisSandbox'))"
                       @click.stop="installCatalogToCurrent(skill)"
                     >
-                      {{ $t('agent.editor.installShort') }}
+                      {{ installsAnUpgrade(skill) ? $t('settings.skills.upgrade') : $t('agent.editor.installShort') }}
                     </t-button>
                     <t-button
-                      v-else-if="isSkillBusy(skill)"
+                      v-else-if="canUpgradeSkillRow(skill)"
+                      size="small"
+                      variant="text"
+                      theme="primary"
+                      :loading="installingCatalogId === skill.id"
+                      :title="hostOnly ? $t('agent.editor.hostUpgradeOnThisComputer') : $t('agent.editor.upgradeOnThisSandbox')"
+                      @click.stop="installCatalogToCurrent(skill)"
+                    >
+                      {{ $t('settings.skills.upgrade') }}
+                    </t-button>
+                    <t-button
+                      v-else-if="canInstallSkills && isSkillBusy(skill)"
                       size="small"
                       variant="text"
                       theme="primary"
@@ -1595,8 +1637,9 @@
         </div>
       </div>
 
-      <!-- 检索策略（仅在有知识库能力时显示） -->
-      <div v-show="currentSection === 'retrieval' && hasKnowledgeBase" class="section">
+      <!-- 检索策略（仅普通模式且有知识库能力时显示；Agent 模式的 search_knowledge
+           使用全局检索配置，这里的设置对它不生效） -->
+      <div v-show="currentSection === 'retrieval' && hasKnowledgeBase && !isAgentMode" class="section">
         <div class="section-header">
           <h2>{{ $t('agent.editor.retrievalStrategy') }}</h2>
           <p class="section-description">{{ $t('agentEditor.desc.retrievalSection') }}</p>
@@ -1812,6 +1855,7 @@ import { type ModelConfig } from '@/api/model';
 import { type AgentNotReadyReasonKey, agentRequiresRerankModel } from '@/utils/agent-readiness';
 import { normalizeLegacyToolNames } from '@/utils/legacy-tool-names';
 import { installSkillCatalog, type SkillCatalogItem } from '@/api/skill';
+import { installUpgradable, servedPreviousText, upgradeVersions } from '@/utils/skillUpgrade';
 import { type WebSearchProviderEntity } from '@/api/web-search-provider';
 import {
   isNamedSandboxBackend,
@@ -1824,6 +1868,8 @@ import { useUIStore } from '@/stores/ui';
 import { useAuthStore } from '@/stores/auth';
 import { useOrganizationStore } from '@/stores/organization';
 import { useChatResourcesStore } from '@/stores/chatResources';
+import { useDeploymentCapabilitiesStore } from '@/stores/deploymentCapabilities';
+import { HOST_SKILL_TARGET_ID, hostSkillTargetRecord, hostSkillsOnly } from '@/utils/skillTarget';
 import { useEditorResourcesStore } from '@/stores/editorResources';
 import AgentAvatar from '@/components/AgentAvatar.vue';
 import PromptTemplateSelector from '@/components/PromptTemplateSelector.vue';
@@ -1836,12 +1882,24 @@ import { SKILL_ICON } from '@/types/mention';
 import { listEmbedChannels } from '@/api/embed';
 import { getRootZoom, rectToCssPx } from '@/utils/zoom';
 import { integrationSectionKey } from '@/config/settingsRoute';
+import { toolboxLocation } from '@/config/toolbox';
 import {
   evaluateToolRequirement,
   deriveKbFilterFromTools,
   type RequirementMissKind,
   type ScopeCapabilities,
 } from '@/utils/tool-capabilities';
+import {
+  clampLevel,
+  levelDescriptionKey,
+  levelEnablesThinking,
+  levelFromLegacy,
+  levelLabelKey,
+  modelCanThink,
+  modelCannotDisableThinking,
+  optionsFor,
+  type ReasoningLevel,
+} from '@/utils/reasoningEffort';
 
 // File extensions offered in the agent-level chat attachment parsing policy.
 const CHAT_PARSER_EXTENSIONS = [
@@ -1852,6 +1910,7 @@ const CHAT_PARSER_EXTENSIONS = [
 
 const uiStore = useUIStore();
 const authStore = useAuthStore();
+const deploymentCapabilities = useDeploymentCapabilitiesStore();
 const router = useRouter();
 const orgStore = useOrganizationStore();
 const chatResources = useChatResourcesStore();
@@ -2038,9 +2097,17 @@ const skillCatalog = ref<SkillCatalogItem[]>([]);
 const catalogReady = ref(false);
 const installingCatalogId = ref('');
 const skillsSelectionMode = ref<'all' | 'selected' | 'none'>('none');
-const hasSandboxSelected = computed(() => !!formData.value.config.sandbox_config_id);
+const hostOnly = computed(() => hostSkillsOnly(
+  deploymentCapabilities.isSupported('settings.sandbox.remote'),
+  deploymentCapabilities.isSupported('settings.sandbox.host'),
+));
+// Where this agent's skills install and run.
+const skillTargetId = computed(() =>
+  hostOnly.value ? HOST_SKILL_TARGET_ID : (formData.value.config.sandbox_config_id || ''),
+);
+const hasSandboxSelected = computed(() => !!skillTargetId.value);
 const canEnableSkills = computed(() =>
-  hasSandboxSelected.value || namedSandboxConfigs().length === 1,
+  hostOnly.value || hasSandboxSelected.value || namedSandboxConfigs().length === 1,
 );
 const canInstallSkills = computed(() => authStore.hasRole('admin'));
 
@@ -2049,10 +2116,16 @@ type CatalogSkillRow = SkillCatalogItem & {
   selectable: boolean
   installStatus: string
   installEnabled: boolean
+  // The install on this sandbox is still on an archive the catalog has moved past.
+  upgradable: boolean
+  installVersion: string
+  // Set while a newer install runs or after it failed: the sandbox still runs
+  // the previous version, so the skill stays usable.
+  servedNote: string
 }
 
 const catalogSkillRows = computed<CatalogSkillRow[]>(() => {
-  const sandboxId = formData.value.config.sandbox_config_id || ''
+  const sandboxId = skillTargetId.value
   return skillCatalog.value.map((item) => {
     const inst = sandboxId
       ? (item.installations || []).find((row) => row.sandbox_config_id === sandboxId)
@@ -2060,8 +2133,13 @@ const catalogSkillRows = computed<CatalogSkillRow[]>(() => {
     const installStatus = inst?.status || ''
     const installEnabled = Boolean(inst?.enabled)
     const installed = Boolean(inst) && installStatus !== 'removed'
-    const selectable = installStatus === 'ready' && installEnabled
-    return { ...item, installed, selectable, installStatus, installEnabled }
+    const servedNote = inst ? servedPreviousText(t, inst) : ''
+    const selectable = installEnabled && (installStatus === 'ready' || Boolean(servedNote))
+    const upgradable = Boolean(inst && installUpgradable(item, inst))
+    return {
+      ...item, installed, selectable, installStatus, installEnabled,
+      upgradable, installVersion: inst?.version || '', servedNote,
+    }
   })
 })
 
@@ -2072,6 +2150,11 @@ const showCatalogSkillList = computed(() =>
 )
 
 const skillsSelectionHint = computed(() => {
+  if (hostOnly.value) {
+    if (skillsSelectionMode.value === 'all') return t('agent.editor.hostSkillsAllListHint')
+    if (skillsSelectionMode.value === 'selected') return t('agent.editor.hostSelectSkillsDesc')
+    return t('agent.editor.hostSkillsSelectionDesc')
+  }
   if (skillsSelectionMode.value === 'all') return t('agent.editor.skillsAllListHint')
   if (skillsSelectionMode.value === 'selected') return t('agent.editor.selectSkillsDesc')
   return t('agent.editor.skillsSelectionDesc')
@@ -2104,7 +2187,7 @@ function skillStatusHint(skill: CatalogSkillRow): string {
   if (skill.installStatus === 'failed') return t('settings.sandbox.skillStatusFailed')
   if (skill.installStatus === 'removing') return t('settings.sandbox.skillStatusRemoving')
   if (skill.installStatus === 'ready' && !skill.installEnabled) {
-    return t('agent.editor.skillDisabledOnSandbox')
+    return hostOnly.value ? t('agent.editor.hostSkillDisabled') : t('agent.editor.skillDisabledOnSandbox')
   }
   return t('agent.editor.skillNotReady')
 }
@@ -2125,11 +2208,32 @@ function canInstallSkillRow(skill: CatalogSkillRow): boolean {
   return !skill.installed || skill.installStatus === 'failed'
 }
 
+// Upgrading writes the sandbox image through the same admin-only catalog
+// install, so it is offered, and even mentioned, only to those who can run it.
+function canUpgradeSkillRow(skill: CatalogSkillRow): boolean {
+  return canInstallSkills.value && hasSandboxSelected.value && skill.upgradable
+}
+
+// Installing the catalog version over what this sandbox has is an upgrade:
+// over an outdated install, or over a failed upgrade whose previous version
+// still runs. Only a skill the sandbox has never carried is a plain install.
+function installsAnUpgrade(skill: CatalogSkillRow): boolean {
+  return skill.upgradable || Boolean(skill.servedNote)
+}
+
+function skillUpgradeHint(skill: CatalogSkillRow): string {
+  const versions = upgradeVersions(skill, { version: skill.installVersion })
+  return versions
+    ? t('settings.skills.upgradeFromTo', versions)
+    : t('settings.skills.upgradeAvailable')
+}
+
 function namedSandboxConfigs(): SandboxConfigRecord[] {
   return chatResources.sandboxConfigs.filter((cfg) => isNamedSandboxBackend(cfg.sandbox_type))
 }
 
 function autoBindSoleSandbox() {
+  if (hostOnly.value) return
   if (skillsSelectionMode.value === 'none') return
   if (formData.value.config.sandbox_config_id) return
   const configs = namedSandboxConfigs()
@@ -2139,8 +2243,10 @@ function autoBindSoleSandbox() {
 }
 
 function openSkillSettings() {
-  const configId = formData.value.config.sandbox_config_id || ''
-  uiStore.openSettings('skills', configId || undefined)
+  const configId = skillTargetId.value
+  modalShell.requestClose(() => {
+    void router.push(toolboxLocation('skills', configId || undefined))
+  })
 }
 
 const showSkillProgress = ref(false)
@@ -2154,6 +2260,7 @@ const skillProgressDesc = computed(() => {
 })
 
 function sandboxRecordById(configId: string): SandboxConfigRecord | undefined {
+  if (hostOnly.value && configId === HOST_SKILL_TARGET_ID) return hostSkillTargetRecord(t('settings.skills.hostTarget'))
   return chatResources.sandboxConfigs.find((cfg) => cfg.id === configId)
 }
 
@@ -2162,7 +2269,7 @@ function installOnCurrentSandbox(skill: CatalogSkillRow, configId: string) {
 }
 
 async function openSkillInstallProgress(skill: CatalogSkillRow) {
-  const configId = formData.value.config.sandbox_config_id || ''
+  const configId = skillTargetId.value
   const record = sandboxRecordById(configId)
   if (!record) {
     openSkillSettings()
@@ -2194,7 +2301,11 @@ function onSkillProgressChanged() {
 
 function pruneSelectedSkills() {
   if (!catalogReady.value) return
-  const names = new Set(catalogSkillRows.value.filter((skill) => skill.selectable).map((skill) => skill.name))
+  // A skill being upgraded is briefly not ready, and dropping it here would
+  // silently unselect it for good once the agent is saved.
+  const names = new Set(catalogSkillRows.value
+    .filter((skill) => skill.selectable || (skill.installed && isSkillBusy(skill)))
+    .map((skill) => skill.name))
   const selected: string[] = formData.value.config.selected_skills || []
   const kept = selected.filter((name: string) => names.has(name))
   if (kept.length !== selected.length) {
@@ -2204,8 +2315,10 @@ function pruneSelectedSkills() {
 
 async function syncInstalledSkills(force = false) {
   autoBindSoleSandbox()
-  const configId = formData.value.config.sandbox_config_id || ''
-  await editorResources.ensureSkills(configId, force)
+  const configId = skillTargetId.value
+  // The editor only edits this workspace's agents, so the sandbox config is
+  // local and needs no source-workspace scope.
+  await editorResources.ensureSkills(configId, undefined, force)
   try {
     await editorResources.ensureSkillCatalog(force)
     skillCatalog.value = [...editorResources.skillCatalog]
@@ -2217,16 +2330,17 @@ async function syncInstalledSkills(force = false) {
 }
 
 async function installCatalogToCurrent(skill: CatalogSkillRow) {
-  const configId = formData.value.config.sandbox_config_id || ''
+  const configId = skillTargetId.value
   if (!configId || installingCatalogId.value) return
   installingCatalogId.value = skill.id
+  const upgrading = installsAnUpgrade(skill)
   try {
     const res = await installSkillCatalog(skill.id, [configId])
     const failed = Object.keys(res?.data?.errors || {}).length
     if (failed > 0) {
       MessagePlugin.warning(t('settings.skills.installPartial', { failed }))
     } else {
-      MessagePlugin.success(t('settings.skills.installAccepted'))
+      MessagePlugin.success(t(upgrading ? 'settings.skills.upgradeAccepted' : 'settings.skills.installAccepted'))
     }
     await syncInstalledSkills(true)
   } catch (e: any) {
@@ -2624,11 +2738,13 @@ const navItems = computed(() => {
     { key: 'model', icon: 'control-platform', label: t('agent.editor.modelConfig') },
     { key: 'suggestions', icon: 'help-circle', label: t('agentEditor.questionSuggestions.navLabel') },
   ];
-  // 多轮对话（两种模式都需要：Agent 模式同样按 history_turns 截断历史）
+  // 多轮对话（两种模式都需要：Agent 模式在这里说明历史自动管理、保留检索结果）
   items.push({ key: 'conversation', icon: 'chat', label: t('agent.editor.conversationSettings') });
   // 知识库与检索
   items.push({ key: 'knowledge', icon: 'folder', label: t('agent.editor.knowledgeConfig') });
-  if (hasKnowledgeBase.value) {
+  // 检索策略只作用于普通模式的问答流程；Agent 模式的检索工具不读这些设置，
+  // 显示出来只会让用户调了参数却没有任何效果。
+  if (hasKnowledgeBase.value && !isAgentMode.value) {
     items.push({ key: 'retrieval', icon: 'search', label: t('agent.editor.retrievalStrategy') });
   }
   items.push({ key: 'websearch', icon: 'internet', label: t('agent.editor.webSearchConfig') });
@@ -2691,6 +2807,7 @@ const defaultFormData = {
     temperature: 0.7,
     max_completion_tokens: 0,
     thinking: false, // 默认禁用思考模式
+    reasoning_effort: 'off', // 思考强度；与 thinking 布尔保持同步
     citation_enabled: true, // 默认输出知识库/网页来源引用
     // Agent模式设置
     max_iterations: 10,
@@ -3311,11 +3428,47 @@ const onAgentTypeChange = (val: AgentType) => {
   }
 };
 
-// 思考模式计算属性（直接绑定 boolean）
-const thinkingEnabled = computed({
-  get: () => formData.value.config.thinking === true,
-  set: (val: boolean) => { formData.value.config.thinking = val; }
+// 思考强度：reasoning_effort 为准，旧数据只有 thinking 布尔时按 true→auto / false→off 推导。
+// 写入时同步维护 thinking 布尔，保证旧后端 / 旧读取路径继续工作。
+const selectedChatModel = computed(() =>
+  allModels.value.find(model => model.id === formData.value.config.model_id),
+);
+const selectedChatModelCanThink = computed(() => modelCanThink(selectedChatModel.value?.capabilities));
+// 所选模型无法关闭思考（deepseek-reasoner / qwq-plus / gemini-3 等）时给出提示，
+// 否则下拉里没有「关闭」看起来像 bug。
+const selectedChatModelAlwaysThinks = computed(
+  () => modelCannotDisableThinking(selectedChatModel.value?.capabilities),
+);
+// 目录上报 capabilities 时严格按 thinking_levels 出选项（含「没有 off」这一事实）；
+// 没有 capabilities 的模型（本地 / Ollama / 模型列表未加载）才退回通用梯度。
+const reasoningEffortOptions = computed<ReasoningLevel[]>(() => optionsFor(selectedChatModel.value?.capabilities));
+const reasoningEffortLevel = computed<ReasoningLevel>({
+  get: () => levelFromLegacy(formData.value.config.thinking, formData.value.config.reasoning_effort),
+  set: (level: ReasoningLevel) => {
+    formData.value.config.reasoning_effort = level;
+    formData.value.config.thinking = levelEnablesThinking(level);
+  },
 });
+// 已存等级可能不在所选模型的可用集合里（换模型，或加载了一个旧智能体）：
+// 夹到可用集合上，并同步 thinking 布尔（由 setter 负责），避免界面显示「关闭」
+// 而后端其实没下发任何开关、模型照样思考。
+//
+// 只在模型真正解析出来之后才夹：模型列表异步加载期间 capabilities 还是 undefined，
+// 此时的通用梯度会把已保存的 max/xhigh 误降级成 auto。
+const clampReasoningEffortToModel = () => {
+  if (editorInitializing.value || !selectedChatModel.value) return;
+  const clamped = clampLevel(reasoningEffortLevel.value, reasoningEffortOptions.value);
+  if (clamped !== reasoningEffortLevel.value) reasoningEffortLevel.value = clamped;
+};
+watch(
+  () => [
+    editorInitializing.value,
+    formData.value.config.model_id,
+    reasoningEffortOptions.value.join(','),
+  ].join('|'),
+  () => clampReasoningEffortToModel(),
+  { immediate: true },
+);
 
 // 是否为内置智能体
 const isBuiltinAgent = computed(() => {
@@ -3353,6 +3506,7 @@ let editorInitializationGeneration = 0;
 watch(() => props.visible, async (val) => {
   const generation = ++editorInitializationGeneration;
   if (val) {
+    void deploymentCapabilities.ensureLoaded();
     editorInitializing.value = true;
     try {
     savedAgent.value = null;
@@ -3375,6 +3529,10 @@ watch(() => props.visible, async (val) => {
       if (agentData.config.thinking == null) {
         agentData.config.thinking = false;
       }
+      // Legacy rows carry only the boolean: derive the graded level once so
+      // the selector and the persisted config agree (true → auto, false → off).
+      agentData.config.reasoning_effort = levelFromLegacy(agentData.config.thinking, agentData.config.reasoning_effort);
+      agentData.config.thinking = levelEnablesThinking(agentData.config.reasoning_effort);
 
       agentData.config.question_suggestions = {
         starters: {
@@ -3759,8 +3917,8 @@ watch(hasKnowledgeBase, (hasKB, oldHasKB) => {
 
 // 监听运行模式变化，自动切换页面
 watch(isAgentMode, (isAgent) => {
-  // 如果当前在高级设置页面但切换到了Agent模式，切换到基础设置
-  if (isAgent && currentSection.value === 'advanced') {
+  // 如果当前在高级设置或检索策略页面但切换到了Agent模式，切换到基础设置
+  if (isAgent && (currentSection.value === 'advanced' || currentSection.value === 'retrieval')) {
     currentSection.value = 'basic';
   }
   if (!isAgent && (currentSection.value === 'skills' || currentSection.value === 'sandbox')) {
@@ -4790,6 +4948,8 @@ const handleSave = async () => {
 
   pruneSelectedSkills()
 
+  if (hostOnly.value) formData.value.config.sandbox_config_id = ''
+
   const payload = { ...formData.value, config: serializeAgentPrompts(formData.value.config, promptTemplates.value) };
   saving.value = true;
   try {
@@ -5139,6 +5299,11 @@ const handleSave = async () => {
   justify-content: flex-end;
   align-items: flex-start;
   overflow: hidden;
+
+  .reasoning-effort-select {
+    width: 100%;
+    max-width: 220px;
+  }
 
   &.setting-control-full {
     width: 100%;
@@ -5994,6 +6159,10 @@ const handleSave = async () => {
   }
 }
 
+.skill-pick__hint--upgrade {
+  color: var(--td-warning-color);
+}
+
 .skill-pick__hint--busy {
   color: var(--td-brand-color);
 
@@ -6435,6 +6604,37 @@ const handleSave = async () => {
 <!-- Non-scoped styles: TDesign teleports the popup outside this component, so
      scoped selectors can't reach .agent-type-popup .t-select-option. -->
 <style lang="less">
+.reasoning-level-select-popup {
+  padding: 4px;
+
+  .t-select-option {
+    height: auto !important;
+    padding: 6px 10px;
+    border-radius: 6px;
+    margin: 2px 0;
+    white-space: normal;
+  }
+}
+
+.reasoning-level-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.35;
+  min-width: 0;
+
+  &__title {
+    font-size: var(--app-text-md);
+    color: var(--td-text-color-primary);
+  }
+
+  &__hint {
+    font-size: var(--app-text-sm);
+    color: var(--td-text-color-placeholder);
+    word-break: break-word;
+  }
+}
+
 .agent-type-popup {
   .t-select-option {
     // 默认 option 是 32px 单行；我们要双行显示，取消固定高度并放宽 padding

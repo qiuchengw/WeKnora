@@ -2,178 +2,190 @@ package service
 
 import (
 	"context"
-	"fmt"
-	"sort"
-	"strings"
+	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/types"
-	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
-// fakeRerankModelService is the smallest ModelService subset needed by
-// knowledgeBaseService.applyRerank: GetRerankModel. Every other method is
-// panic-only via the embedded interface — none are exercised here.
-type fakeRerankModelService struct {
-	interfaces.ModelService
-	model   rerank.Reranker
-	failGet bool
-}
-
-func (f *fakeRerankModelService) GetRerankModel(_ context.Context, modelID string) (rerank.Reranker, error) {
-	if f.failGet {
-		return nil, fmt.Errorf("model %s unavailable", modelID)
-	}
-	return f.model, nil
-}
-
-// fakeReranker mimics a cross-encoder: it scores every passage and returns them
-// sorted by relevance descending, each carrying its input index.
-type fakeReranker struct {
+// scoredReranker returns one canned score per passage, or an error.
+type scoredReranker struct {
 	scores []float64
 	err    error
-	// seen captures the passages handed to the model (passage-construction assertions).
-	seen []string
 }
 
-func (f *fakeReranker) Rerank(_ context.Context, _ string, documents []string) ([]rerank.RankResult, error) {
-	f.seen = append([]string(nil), documents...)
-	if f.err != nil {
-		return nil, f.err
+func (r *scoredReranker) Rerank(_ context.Context, _ string, documents []string) ([]rerank.RankResult, error) {
+	if r.err != nil {
+		return nil, r.err
 	}
-	out := make([]rerank.RankResult, 0, len(documents))
+	out := make([]rerank.RankResult, len(documents))
 	for i := range documents {
-		if i < len(f.scores) {
-			out = append(out, rerank.RankResult{Index: i, RelevanceScore: f.scores[i]})
-		}
+		out[i] = rerank.RankResult{Index: i, RelevanceScore: r.scores[i]}
 	}
-	sort.SliceStable(out, func(a, b int) bool { return out[a].RelevanceScore > out[b].RelevanceScore })
 	return out, nil
 }
 
-func (f *fakeReranker) GetModelName() string { return "fake-rerank" }
-func (f *fakeReranker) GetModelID() string   { return "fake-rerank-id" }
+func (r *scoredReranker) GetModelName() string { return "scored" }
+func (r *scoredReranker) GetModelID() string   { return "scored" }
 
-func resultsForRerank(n int) []*types.SearchResult {
-	out := make([]*types.SearchResult, n)
-	for i := range n {
-		out[i] = &types.SearchResult{Content: fmt.Sprintf("passage %d", i)}
-	}
-	return out
+// rerankModelService serves one reranker (or a load error) on top of
+// stubModelService's model lookups.
+type rerankModelService struct {
+	stubModelService
+	reranker rerank.Reranker
+	loadErr  error
 }
 
-func contentsOf(results []*types.SearchResult) []string {
-	out := make([]string, len(results))
-	for i, r := range results {
-		out[i] = r.Content
-	}
-	return out
+func (s *rerankModelService) GetRerankModel(context.Context, string) (rerank.Reranker, error) {
+	return s.reranker, s.loadErr
 }
 
-func TestApplyRerank_ReordersByModelScore(t *testing.T) {
-	svc := newKBSvcForValidate(&fakeRerankModelService{
-		model: &fakeReranker{scores: []float64{0.9, 0.1, 0.5}},
+func newRerankModelService() *rerankModelService {
+	return &rerankModelService{stubModelService: stubModelService{
+		modelsByID: map[string]*types.Model{
+			"rr-1":   {ID: "rr-1", Type: types.ModelTypeRerank},
+			"chat-1": {ID: "chat-1", Type: types.ModelTypeKnowledgeQA},
+		},
+		availableModels: []*types.Model{
+			{ID: "chat-1", Type: types.ModelTypeKnowledgeQA},
+			{ID: "rr-auto", Type: types.ModelTypeRerank},
+		},
+	}}
+}
+
+func TestResolveRerankModelID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	models := newRerankModelService()
+	tenantRC := &types.RetrievalConfig{RerankModelID: "rr-tenant"}
+
+	id, source, err := resolveRerankModelID(ctx, models, "rr-1", tenantRC)
+	require.NoError(t, err)
+	assert.Equal(t, "rr-1", id)
+	assert.Equal(t, types.RerankModelSourceRequest, source)
+
+	id, source, err = resolveRerankModelID(ctx, models, "", tenantRC)
+	require.NoError(t, err)
+	assert.Equal(t, "rr-tenant", id)
+	assert.Equal(t, types.RerankModelSourceTenant, source)
+
+	id, source, err = resolveRerankModelID(ctx, models, "", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "rr-auto", id)
+	assert.Equal(t, types.RerankModelSourceAuto, source)
+
+	models.availableModels = nil
+	id, source, err = resolveRerankModelID(ctx, models, "", nil)
+	require.NoError(t, err)
+	assert.Empty(t, id)
+	assert.Empty(t, source)
+
+	// A requested model never silently falls back to another one.
+	for _, requested := range []string{"missing", "chat-1"} {
+		_, _, err = resolveRerankModelID(ctx, models, requested, tenantRC)
+		appErr, ok := apperrors.IsAppError(err)
+		require.True(t, ok, "requested %q: %v", requested, err)
+		assert.Equal(t, apperrors.ErrBadRequest, appErr.Code, "requested %q", requested)
+	}
+}
+
+func rerankTestCandidates() []*types.SearchResult {
+	return []*types.SearchResult{
+		{ID: "c1", Content: "first body", Score: 0.9},
+		{ID: "c2", Content: "second body", Score: 0.8},
+		{ID: "c3", Content: "third body", Score: 0.7},
+	}
+}
+
+func TestRerankCandidates_reranksAndKeepsModelSource(t *testing.T) {
+	t.Parallel()
+	models := newRerankModelService()
+	models.reranker = &scoredReranker{scores: []float64{0.1, 0.9, 0.5}}
+	s := &knowledgeBaseService{modelService: models}
+	diag := &types.RerankDiagnostics{ModelSource: types.RerankModelSourceRequest}
+
+	got := s.rerankCandidates(context.Background(), "rr-1", "q", rerankTestCandidates(), 0.3, 2, diag)
+
+	require.Len(t, got, 2)
+	assert.Equal(t, "c2", got[0].ID)
+	assert.Equal(t, "c3", got[1].ID)
+	assert.Equal(t, types.RerankOutcomeOK, diag.Outcome)
+	assert.True(t, diag.Applied)
+	assert.Equal(t, "rr-1", diag.ModelID)
+	assert.Equal(t, types.RerankModelSourceRequest, diag.ModelSource)
+	assert.Equal(t, 0.9, diag.TopScore)
+}
+
+func TestRerankCandidates_degradesToRetrievalOrder(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		modelID string
+		model   rerank.Reranker
+		loadErr error
+		want    types.RerankOutcome
+	}{
+		{name: "no model", modelID: "", want: types.RerankOutcomeNoModel},
+		{
+			name: "model unavailable", modelID: "rr-1", loadErr: errors.New("bad credentials"),
+			want: types.RerankOutcomeModelUnavailable,
+		},
+		{
+			name: "model error", modelID: "rr-1", model: &scoredReranker{err: errors.New("upstream 500")},
+			want: types.RerankOutcomeModelError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			models := newRerankModelService()
+			models.reranker, models.loadErr = tt.model, tt.loadErr
+			s := &knowledgeBaseService{modelService: models}
+			diag := &types.RerankDiagnostics{}
+
+			got := s.rerankCandidates(context.Background(), tt.modelID, "q", rerankTestCandidates(), 0.3, 2, diag)
+
+			require.Len(t, got, 2)
+			assert.Equal(t, "c1", got[0].ID)
+			assert.Equal(t, "c2", got[1].ID)
+			assert.Equal(t, tt.want, diag.Outcome)
+			assert.False(t, diag.Applied)
+		})
+	}
+}
+
+func TestApplyKnowledgeSearchOverrides(t *testing.T) {
+	t.Parallel()
+	base := func() *types.ChatManage {
+		return &types.ChatManage{PipelineRequest: types.PipelineRequest{
+			EmbeddingTopK: 50, VectorThreshold: 0.15, KeywordThreshold: 0.3, RerankTopK: 10, RerankThreshold: 0.2,
+		}}
+	}
+
+	cm := base()
+	applyKnowledgeSearchOverrides(cm, &types.KnowledgeSearchOptions{})
+	assert.Equal(t, base().PipelineRequest, cm.PipelineRequest, "no overrides keep the tenant config")
+
+	vector, keyword, threshold := 0.5, 0.6, -1.5
+	cm = base()
+	applyKnowledgeSearchOverrides(cm, &types.KnowledgeSearchOptions{
+		VectorThreshold: &vector, KeywordThreshold: &keyword, MatchCount: 80,
 	})
-	cfg := &types.RetrievalConfig{RerankModelID: "r1"}
+	assert.Equal(t, 0.5, cm.VectorThreshold)
+	assert.Equal(t, 0.6, cm.KeywordThreshold)
+	assert.Equal(t, 80, cm.RerankTopK, "match_count is the final result count")
+	assert.Equal(t, 80, cm.EmbeddingTopK, "recall must be deep enough to reach match_count")
 
-	got := svc.applyRerank(context.Background(), cfg, "q", resultsForRerank(3))
-
-	want := []string{"passage 0", "passage 2", "passage 1"}
-	for i, w := range want {
-		if got[i].Content != w {
-			t.Fatalf("position %d: got %q, want %q (full: %v)", i, got[i].Content, w, contentsOf(got))
-		}
-	}
-}
-
-func TestApplyRerank_PassageIncludesKnowledgeTitle(t *testing.T) {
-	model := &fakeReranker{scores: []float64{0.9, 0.9}}
-	svc := newKBSvcForValidate(&fakeRerankModelService{model: model})
-	results := []*types.SearchResult{
-		{KnowledgeTitle: "影子灰度策略", Content: "先让一小部分流量走新链路。"},
-		{Content: "无标题片段"},
-	}
-
-	svc.applyRerank(context.Background(), &types.RetrievalConfig{RerankModelID: "r1"}, "影子灰度策略", results)
-
-	if len(model.seen) != 2 {
-		t.Fatalf("expected 2 passages, got %d: %v", len(model.seen), model.seen)
-	}
-	if !strings.Contains(model.seen[0], "影子灰度策略") || !strings.Contains(model.seen[0], "先让一小部分流量走新链路") {
-		t.Fatalf("passage must carry title + content, got %q", model.seen[0])
-	}
-	if model.seen[1] != "无标题片段" {
-		t.Fatalf("titleless passage must pass through unchanged, got %q", model.seen[1])
-	}
-}
-
-func TestApplyRerank_DropsScoresBelowThreshold(t *testing.T) {
-	svc := newKBSvcForFinding(t)
-	svc.modelService = &fakeRerankModelService{
-		model: &fakeReranker{scores: []float64{0.9, 0.05}},
-	}
-	// RerankThreshold is applied as-is for a non-nil config (the 0.2 default only
-	// applies to a nil config), so an explicit threshold is required to drop the
-	// low-scoring hit.
-	cfg := &types.RetrievalConfig{RerankModelID: "r1", RerankThreshold: 0.2}
-
-	got := svc.applyRerank(context.Background(), cfg, "q", resultsForRerank(2))
-
-	if len(got) != 1 || got[0].Content != "passage 0" {
-		t.Fatalf("got %v, want only the high-scoring passage", contentsOf(got))
-	}
-}
-
-func TestApplyRerank_NoModelConfiguredKeepsFusedOrder(t *testing.T) {
-	svc := newKBSvcForValidate(&fakeRerankModelService{
-		model: &fakeReranker{scores: []float64{0.9, 0.1}},
+	cm = base()
+	applyKnowledgeSearchOverrides(cm, &types.KnowledgeSearchOptions{
+		MatchCount: 20,
+		Rerank:     &types.RerankOptions{TopK: 5, Threshold: &threshold},
 	})
-
-	for name, cfg := range map[string]*types.RetrievalConfig{
-		"nil config":  nil,
-		"empty model": {RerankModelID: ""},
-	} {
-		got := svc.applyRerank(context.Background(), cfg, "q", resultsForRerank(2))
-		if contents := contentsOf(got); contents[0] != "passage 0" || contents[1] != "passage 1" {
-			t.Fatalf("%s: fused order must be preserved, got %v", name, contents)
-		}
-	}
-}
-
-func TestApplyRerank_FailuresKeepFusedOrder(t *testing.T) {
-	cases := map[string]interfaces.ModelService{
-		"model lookup failure": &fakeRerankModelService{failGet: true},
-		"model call failure":   &fakeRerankModelService{model: &fakeReranker{err: fmt.Errorf("boom")}},
-	}
-	for name, svcModel := range cases {
-		svc := newKBSvcForValidate(svcModel)
-		got := svc.applyRerank(context.Background(), &types.RetrievalConfig{RerankModelID: "r1"}, "q", resultsForRerank(2))
-		if contents := contentsOf(got); contents[0] != "passage 0" || contents[1] != "passage 1" {
-			t.Fatalf("%s: fused order must be preserved, got %v", name, contents)
-		}
-	}
-}
-
-func TestApplyRerank_KeepsTailBeyondRerankTopK(t *testing.T) {
-	svc := newKBSvcForValidate(&fakeRerankModelService{
-		model: &fakeReranker{scores: []float64{0.9, 0.8}},
-	})
-	cfg := &types.RetrievalConfig{RerankModelID: "r1", RerankTopK: 2}
-
-	got := svc.applyRerank(context.Background(), cfg, "q", resultsForRerank(4))
-
-	if len(got) != 4 {
-		t.Fatalf("got %d results, want 4 (reranked prefix + untouched tail)", len(got))
-	}
-	if got[2].Content != "passage 2" || got[3].Content != "passage 3" {
-		t.Fatalf("tail beyond RerankTopK must keep fused order, got %v", contentsOf(got))
-	}
-}
-
-// newKBSvcForFinding is newKBSvcForValidate with an explicit name for tests that
-// mutate the service after construction.
-func newKBSvcForFinding(t *testing.T) *knowledgeBaseService {
-	t.Helper()
-	return newKBSvcForValidate(nil)
+	assert.Equal(t, 5, cm.RerankTopK, "rerank.top_k wins over match_count")
+	assert.Equal(t, -1.5, cm.RerankThreshold)
+	assert.Equal(t, 50, cm.EmbeddingTopK)
 }
