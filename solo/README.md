@@ -93,6 +93,25 @@
   库版本 < 本产物 `migrations/sqlite` 最大版本 ⇒ `engine_migration_incomplete`，两者都不进入 ready 且不写
   `engine-last-run.json`；installer `--doctor` 增 `service.kb-engine-schema` 只读转发该结论。
 
+### 上游同步记录（2026-10-11）
+
+- 同步到上游 `150d8cc60`（**175 commit**，自 `9fcc2c67`），**0 处文本冲突**（合并全自动，提交 `bc62e145b`）。
+- **编译门禁 ✓**：`go build -tags sqlite_fts5 ./...` + 关键包 `-run` 用例——Solo 侧首验 **311s** 通过；
+  构建侧门禁 win **236s** / linux（WSL）**547s** 亦通过；**未复现 09-18 的"合并不冲突却编译不过"**。
+- **工具链事实（本次实测入账）**：DuckDB 静态库为 **GCC/libstdc++ ABI** ⇒ Windows 构建必须 **WinLibs GCC**；
+  用 LLVM-MinGW（或裸 `go build` 未设 `CC` 时误选 LLVM 链）链接期报
+  `undefined symbol: std::__throw_system_error / pthread_mutex_init`。**正确入口 = 唯一配方
+  `scripts/kb-engine/build-weknora-lite.sh`**（三级工具链探测），不要裸跑 `go build`。
+- 车道净增仍 **3 项独有**（问数端点 · DuckDB 有界扩展安装 · `content_revision` 投影）——合并后逐项 grep 存活核对
+  （`container.go` 探活门控 / `routes_knowledge.go` 两端点 / `knowledgebase.go` 投影调用 / 投影整文件）。
+- **消费侧 wire 核对（跨仓同批）**：`knowledge_id` / `knowledge_title` / `match_type` / `content_revision` /
+  `meta.rerank`（`retrieval.Meta` 原样透出）/ `system/info` 的 `db_version`/`db_migration_error` 均未改名
+  ⇒ Solo 侧 `client.ts` 零跟随。
+- 上游新增 sqlite 迁移 **+1 条**（至 `000034_mcp_metadata`）。
+- **升级迁移演练（发版前必跑，实跑通过）**：旧 `0.8.5` 空目录建库 ⇒ `(33,0)`/79 表；新 `0.8.7` **同一数据目录**
+  启动 ⇒ `(34,0)`/80 表 + 自报 `Database migrated from 33 to 34` + `/health` 200 + 无 migration failed ⇒ **PASS**。
+- 产物事实（0.8.7 双平台 sha512 / 构建命令）记在发布侧：Solo 主仓 `docs/tests/组织知识库.md` §4.8。
+
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
 > 与「产物事实」的分工：上方已拍板**产物事实只在发布侧记一处**（每构建就变的数字）；本台账记的是
@@ -109,6 +128,7 @@
 | 2026-09-18 | `2122a75` → `aaec920a`（80 commit / 1115 文件） | 0（文本合并零冲突；**字段改名 SQL 编译错一处**，同变更集修） | ~1 | ✗（当时门禁未机械化——本次教训成文并催生本台账） | 见上方同步记录 |
 | 2026-09-22 | —（无同步；**门禁启用首跑**） | — | ~0.5 | ✓ `go build ./...` + 车道用例全绿（types/agent/agent.tools/handler/service，门禁 116s） | 阈值累计自此行开始 |
 | 2026-09-26 | `aaec920a` → `9fcc2c67`（186 commit / 1733 文件） | **≈483**（5 处：service 95 + 其测试 362 + container 4 + handler 10 + types 12；**其中 457 行是"上游已收编 ⇒ 整文件取上游"**，真需人工判断的仅 ~26 行） | ~1.5 | ✓ `go build ./...` + 车道用例全绿（129s）；产物冒烟 253M | 见上方同步记录；**车道净减 2 项**（E1/`enable_rerank` 被上游收编） |
+| 2026-10-11 | `9fcc2c67` → `150d8cc60`（175 commit） | 0（全自动） | ~0.5 | ✓ `go build ./...` + 车道用例全绿（Solo 侧 311s；构建侧 win 236s / linux 547s） | 见上方同步记录；0.8.7 产物双平台 + 升级演练 PASS（33→34） |
 
 ## 为什么需要本车道（但源码改动很少）
 
