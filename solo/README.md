@@ -1,29 +1,30 @@
 # `solo/` —— WeKnora 下游车道（Solo 知识库引擎）
 
-本目录是 **Solo 产品线对上游 WeKnora 的增量**，承载构建脚本与 CI 说明；**源码改动本身以 `solo` 分支的提交承载**（见下）。
+本目录是 **Solo 产品线对上游 WeKnora 的增量**，承载构建脚本与 CI 说明；**源码改动本身以 `main` 分支的提交承载**（见下）。
 
-- 上游基线：`Tencent/WeKnora`（远端 `origin`；fork：`qiuchengw/WeKnora`，远端 `fork-ssh`，车道分支：`solo`）
-  - **当前基线 = 上游 `main` 合并点**（`2122a75`，2026-09-12 用户在 fork 侧同步）。
+- 上游基线：`Tencent/WeKnora`（远端 `upstream`，只拉）；fork：`qiuchengw/WeKnora`（远端 `origin`，**单一车道分支 `main`**）
+  - **2026-11-10 起单分支拓扑**：`main` = 上游 + 车道提交；fork 的 `solo` 分支已删除，纯上游基线只看 `upstream/main`。
+  - **当前基线 = 上游 `main` 合并点**（`cbdcebab`，2026-11-10）。
   - 发布物按**具体 commit SHA** 记录：上游基线 SHA + 本车道分支 SHA + 构建命令 + SHA256（`main` 是移动目标）。
 - 决策依据：`solo` 仓库 `docs/adr/0019-kb-engine-externalization.md`（D-13 构建来源纪律、D-15 车道模型、D-16 问数归属）。
 - 形态：**单进程无头服务**（`cmd/server`，`EDITION=lite`），由 Solo 宿主 spawn 一个子进程，走 `127.0.0.1 + token`。
 
 ## 车道模型（2026-09-12 收敛：分支提交，不再是 patch 文件）
 
-**产物源码 = 本仓 `solo` 分支 HEAD**（上游 `main` + 我们的改动）。
+**产物源码 = 本仓 `main` 分支 HEAD**（上游 `main` + 我们的改动）。
 
 | | patch 文件车道（已退役） | **分支提交车道（现行）** |
 |---|---|---|
-| 我们的改动存放 | `solo/patches/*.patch`（构建时 `git apply`） | `solo` 分支上的提交（**一 commit = 一个上游 PR 候选**） |
-| 上游漂移 | 每个 patch 逐个 3-way + **重新生成 patch 文件** | `git merge origin/main`，冲突在 git 里解决一次 |
+| 我们的改动存放 | `solo/patches/*.patch`（构建时 `git apply`） | `main` 分支上的提交（**一 commit = 一个上游 PR 候选**） |
+| 上游漂移 | 每个 patch 逐个 3-way + **重新生成 patch 文件** | `git merge upstream/main`，冲突在 git 里解决一次 |
 | 真相数量 | 两处：patch 文件 + 工作树「设计态」脏 | 一处：分支 HEAD（`git status` 干净） |
 | 构建 | 需先应用补丁（失败要显式报错兜底） | 直接构建当前分支 |
 
 - 为何退役：patch 只是同一份分叉的另一种编码，却把「上游一动」变成「逐个重生成」的持续成本；git merge 的 3-way 能力显著强于 `git apply` 的上下文匹配。
 - 保留的纪律：**一个 commit = 一个上游 PR 候选**（commit message 写明动机 + 实测证据），便于随时逐个提 PR；上游合并后对应 commit 自然成为空操作（rebase/merge 时消失）。
-- 纯上游对照构建：直接 `git checkout origin/main` 构建，不再需要 `--no-patches`。
+- 纯上游对照构建：`git worktree add /tmp/upstream upstream/main` 后构建，不再需要 `--no-patches`。
 
-**车道当前内容（`git log upstream/main..solo`）**：
+**车道当前内容（`git log upstream/main..main`）**：
 
 | commit | 变更 | 性质 |
 |---|---|---|
@@ -112,7 +113,7 @@
   启动 ⇒ `(34,0)`/80 表 + 自报 `Database migrated from 33 to 34` + `/health` 200 + 无 migration failed ⇒ **PASS**。
 - 产物事实（0.8.7 双平台 sha512 / 构建命令）记在发布侧：Solo 主仓 `docs/tests/组织知识库.md` §4.8。
 
-### 上游同步记录（2026-11-10，候选分支；待拍板合入）
+### 上游同步记录（2026-11-10，已合入 `main`）
 
 - 同步到上游 `cbdcebab`（**568 commit / 2775 文件**，+384,677/−58,356，自 `150d8cc60`）；上游 `VERSION` **0.8.2 → 0.9.0**。
 - **文本冲突 1 处**：`internal/router/router.go`（车道 `KnowledgeDataQueryHandler` 参数 vs 上游新增
@@ -140,7 +141,8 @@
 - **上游本批主题**（与本车道无重叠）：automations、agent grants/collaborations、credential vault、Feishu 深适配、
   MCP tool risk、session kind/owner auth source、sandbox user allocation；新增依赖 `goldmark` / `xlsReader` / `fmtdate`，
   Go `1.26.0` 与构建标签不变。
-- **候选分支**：本机 `sync/upstream-0.9.0`（合并提交 + 本文件），**未推 fork、未改 Solo 主仓 gitlink**；合入动作待拍板。
+- **分支收敛（2026-11-10）**：`main` 即车道分支（上游 + 车道提交）；fork 的 `solo` 分支已删除，
+  `origin/main` 不再镜像上游，纯上游对照/比价只看 `upstream/main`。合并提交 `73fdfab7`，本文件与测试签名修复随后同批提交。
 
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
@@ -159,7 +161,7 @@
 | 2026-09-22 | —（无同步；**门禁启用首跑**） | — | ~0.5 | ✓ `go build ./...` + 车道用例全绿（types/agent/agent.tools/handler/service，门禁 116s） | 阈值累计自此行开始 |
 | 2026-09-26 | `aaec920a` → `9fcc2c67`（186 commit / 1733 文件） | **≈483**（5 处：service 95 + 其测试 362 + container 4 + handler 10 + types 12；**其中 457 行是"上游已收编 ⇒ 整文件取上游"**，真需人工判断的仅 ~26 行） | ~1.5 | ✓ `go build ./...` + 车道用例全绿（129s）；产物冒烟 253M | 见上方同步记录；**车道净减 2 项**（E1/`enable_rerank` 被上游收编） |
 | 2026-10-11 | `9fcc2c67` → `150d8cc60`（175 commit） | 0（全自动） | ~0.5 | ✓ `go build ./...` + 车道用例全绿（Solo 侧 311s；构建侧 win 236s / linux 547s） | 见上方同步记录；0.8.7 产物双平台 + 升级演练 PASS（33→34） |
-| 2026-11-10 | `150d8cc60` → `cbdcebab`（568 commit / 2775 文件） | 1 处（`router.go` 6 行；另有 1 处测试签名编译错 `operations_test.go`） | ~1 | ✓ `go build ./...` + 车道用例（462s）；`go test -run '^$' ./internal/...` 全测试包编译 ✓；router / 问数端点用例 ✓ | **候选分支**（待拍板）；上游 0.9.0；sqlite +18 迁移；升级演练 34→52 PASS |
+| 2026-11-10 | `150d8cc60` → `cbdcebab`（568 commit / 2775 文件） | 1 处（`router.go` 6 行；另有 1 处测试签名编译错 `operations_test.go`） | ~1 | ✓ `go build ./...` + 车道用例（462s）；`go test -run '^$' ./internal/...` 全测试包编译 ✓；router / 问数端点用例 ✓ | **已合入 `main`**（单分支拓扑）；上游 0.9.0；sqlite +18 迁移；升级演练 34→52 PASS |
 
 ## 为什么需要本车道（但源码改动很少）
 
@@ -199,14 +201,14 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 
 - 为什么：产物必须能追溯到**确切的源码提交**（ADR-0019 D-13 的 provenance 要求）。子模块的 gitlink 把它变成
   仓库事实（`git rev-parse HEAD` = 产物里的 `CommitID`），并且**消掉了发版脚本里写死的本机绝对路径**；
-- 远端约定（子模块内）：`origin` = fork（`git@github.com:qiuchengw/WeKnora.git`，推 `solo` 分支）；
-  `upstream` = `https://github.com/Tencent/WeKnora.git`（只拉上游）；
+- 远端约定（子模块内）：`origin` = fork（`git@github.com:qiuchengw/WeKnora.git`，推 `main`）；
+  `upstream` = `https://github.com/Tencent/WeKnora.git`（只拉上游；纯上游基线 = `upstream/main`）；
 - **两级提交**（引擎改动必须走完，否则主仓钉的还是旧提交）：
   ```bash
   cd <solo>/packages/kb-engine-src
-  git checkout solo && git merge upstream/main      # 需要同步上游时（先 git fetch upstream --tags）
-  go build ./... && go test ./internal/...          # 文本合并不冲突 ≠ 能编译（2026-09-18 实测）
-  git commit … && git push origin solo              # ① 车道提交推到 fork
+  git checkout main && git merge upstream/main      # 需要同步上游时（先 git fetch upstream --tags）
+  go build ./... && go test -run '^$' ./internal/... # 合并不冲突 ≠ 能编译；全测试包编译（2026-11-10 补）
+  git commit … && git push origin main              # ① 车道提交推到 fork
   cd <solo> && git add packages/kb-engine-src && git commit …   # ② 主仓提交新 gitlink
   ```
 - 发版脚本（`solo/scripts/lib/release-kbengine.mjs`）缺省就用这个子模块，并在构建前**断言 gitlink 工作树干净**；
@@ -219,17 +221,17 @@ bash solo/scripts/build-windows.sh --keep-symbols  # 体积画像（保留符号
 
 ## 上游同步流程（上游出新 tag/推进 main 时）
 
-> 远端命名以「本仓的 canonical 检出位置」一节为准：**`origin` = fork（`qiuchengw/WeKnora`，推 `solo`）**、
+> 远端命名以「本仓的 canonical 检出位置」一节为准：**`origin` = fork（`qiuchengw/WeKnora`，推 `main`）**、
 > **`upstream` = `Tencent/WeKnora`（只拉）**。（下方命令里的旧名 `origin`/`fork-ssh` 是 2026-09-12 前的写法，已更正。）
 
 ```bash
 git fetch upstream --tags            # upstream = Tencent/WeKnora
-git checkout solo
+git checkout main
 git merge upstream/main              # 冲突一次解决（这就是退役 patch 车道的主要收益）
-go build ./... && go test ./internal/... # 车道自检（含新增端点/健壮性用例）
+go build ./... && go test -run '^$' ./internal/... # 全测试包编译（2026-11-10 教训）
 # 或直接跑机械化门禁（推荐，含 tags 与 -run 精确命中）：Solo 主仓
 #   bash scripts/kb-engine/build-weknora-lite.sh --src <本子模块> --out <临时目录>
-git push origin solo                 # 推 fork（两级提交第①步）
+git push origin main                 # 推 fork（两级提交第①步）
 ```
 
 - **必跑编译再判定同步成功**（2026-09-18 实测：80 commit 合并零冲突，却因上游字段改名编译失败）。
@@ -243,7 +245,7 @@ git push origin solo                 # 推 fork（两级提交第①步）
 
 目标形态：**宿主 Agent（唯一编排） + 引擎（无 agent 的纯能力面）**。
 
-- 已就绪：`hybrid-search`（召回）+ `enable_rerank`（重排）；**问数端点** `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema`（DuckDB 执行与表格解析均在引擎）。
+- 已就绪：`hybrid-search`（召回）+ `rerank` 对象（重排）；**问数端点** `POST /knowledge/:id/data-analysis` + `GET /knowledge/:id/data-schema`（DuckDB 执行与表格解析均在引擎）。
 - 宿主侧：`KbEnginePort` 收口端点；工具注册走已有 `agent.mastra.tool` 机制（`kb_search` / `kb_data_schema` / `kb_data_query`）；MCP 作为后续可选薄壳。宿主 Agent 只做“问题→只读 SQL”的规划与结果解释。
 - 待定：`POST /engine-tools/{tool}` 通用工具端点（E5，仅在出现第二消费方时推进）。
 - 许可清单随包（`scripts/copy-licenses.sh`）与发布物装配（Solo 侧 W5）。

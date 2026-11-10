@@ -2,19 +2,21 @@ name: solo-lite-windows
 
 # Solo 版 WeKnora Lite（Windows/amd64）构件工作流。
 # 上游 Docker/Linux 工作流保持不动；本工作流只构建 cmd/server（EDITION=lite），
-# 走 solo/scripts/build-windows.sh（应用 solo/patches/*.patch → 生成 sqlite3.h → CGO 编译）。
+# 走 solo/scripts/build-windows.sh（零补丁：源码即分支 HEAD → 生成 sqlite3.h → CGO 编译）。
 on:
   push:
-    branches: [solo]
+    branches: [main]
     paths:
+      - 'internal/**'
+      - 'cmd/**'
+      - 'migrations/**'
+      - 'config/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'VERSION'
       - 'solo/**'
       - '.github/workflows/solo-lite-windows.yml'
   workflow_dispatch:
-    inputs:
-      with_patches:
-        description: 'Build with strip patches (optional; removes data_analysis/data_schema)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -41,18 +43,9 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
           path-type: inherit
 
-      - name: Build (EDITION=lite, sqlite_fts5, zero-patch by default)
+      - name: Build (EDITION=lite, sqlite_fts5, zero-patch)
         shell: msys2 {0}
-        env:
-          WITH_PATCHES: ${{ github.event.inputs.with_patches }}
-        run: |
-          if [ "${WITH_PATCHES:-false}" = "true" ]; then
-            echo '>> variant: with strip patches'
-            bash solo/scripts/build-windows.sh --with-patches
-          else
-            echo '>> variant: zero-patch (canonical)'
-            bash solo/scripts/build-windows.sh
-          fi
+        run: bash solo/scripts/build-windows.sh
 
       - name: SHA256
         shell: pwsh
