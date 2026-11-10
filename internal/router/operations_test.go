@@ -21,7 +21,7 @@ import (
 func registerOperationAreas(v1 *gin.RouterGroup, g *rbacGuards) {
 	RegisterKnowledgeBaseRoutes(v1, &handler.KnowledgeBaseHandler{}, g)
 	RegisterKnowledgeBaseActivityRoutes(v1, &handler.AuditLogHandler{}, g)
-	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, g)
+	RegisterKnowledgeRoutes(v1, &handler.KnowledgeHandler{}, &handler.KnowledgeDataQueryHandler{}, g)
 	RegisterWikiPageRoutes(v1, &handler.WikiPageHandler{}, g)
 	RegisterChunkRoutes(v1, &handler.ChunkHandler{}, g)
 	RegisterKnowledgeTagRoutes(v1, &handler.TagHandler{}, g)
