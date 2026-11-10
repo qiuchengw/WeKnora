@@ -112,6 +112,36 @@
   启动 ⇒ `(34,0)`/80 表 + 自报 `Database migrated from 33 to 34` + `/health` 200 + 无 migration failed ⇒ **PASS**。
 - 产物事实（0.8.7 双平台 sha512 / 构建命令）记在发布侧：Solo 主仓 `docs/tests/组织知识库.md` §4.8。
 
+### 上游同步记录（2026-11-10，候选分支；待拍板合入）
+
+- 同步到上游 `cbdcebab`（**568 commit / 2775 文件**，+384,677/−58,356，自 `150d8cc60`）；上游 `VERSION` **0.8.2 → 0.9.0**。
+- **文本冲突 1 处**：`internal/router/router.go`（车道 `KnowledgeDataQueryHandler` 参数 vs 上游新增
+  `RegisterGraphSearchRoutes`，6 行）⇒ **两者都保留**。
+- **编译门禁 ✓**：`go build -tags sqlite_fts5 ./...` + 车道 `-run` 用例全绿（**462s**，WinLibs GCC 16.2.0 / Go 1.26）。
+  **但门禁包集合不含 `internal/router`，漏了一次测试编译错**：上游新增 `internal/router/operations_test.go`
+  仍按三参调用 `RegisterKnowledgeRoutes` ⇒ `go test ./internal/router` 编译失败。补齐第 3 参后
+  `go test ./internal/router` 通过；另跑 **`go test -tags sqlite_fts5 -run '^$' ./internal/...`（全测试包编译）exit 0**。
+  **纪律补丁**：`go build ./...` 不编译 `_test.go` ⇒ 每次同步必须补一次全测试包编译（或把 `internal/router`
+  纳入门禁包集合）。
+- **车道净增仍 3 项独有**：合并树与 pristine 上游逐文件 diff = **16 个车道文件（+954/−15）**；
+  问数两端点 / DuckDB 有界扩展安装 / `content_revision` 投影 grep 存活。上游 0.9.0 **仍不发射**
+  `content_revision`（`SearchResult.ContentRevision` 仍 `json:"-"`），DuckDB 仍是**无界** `INSTALL` 循环
+  （我们的探活门控未被收编）。
+- **消费侧 wire 核对**：`/auth/register|login`、`/tenants`（JWT 自助）、`/tenants/:id/api-keys`（`full_access:true` 语义未变）、
+  `/tenants/kv/:key`、`/knowledge-bases/:id/knowledge/manual`、`/knowledge/:id`、`/knowledge/:id/reparse`、
+  `/knowledge-bases/:id/hybrid-search`（`rerank:{enabled:true}` 与 `meta.rerank`）、`/system/info`
+  的路径与 JSON 键均未变；`system/info` 仅新增附加字段 `db_migration_failed`；`db_version`/`db_migration_error` 保留。
+  **唯一新增行为**：`cmd/server` 自动加载 `.env.lite`（exe 同目录优先，其次 cwd；进程 env 优先，且 Lite 构建不读 `.env`）
+  ⇒ 产物目录**不要**放 `.env.lite`。
+- **升级迁移演练（2026-11-10 实跑，Win32 x64）**：旧 `0.8.7` 空目录建库 ⇒ `schema_migrations=(34,0)` / 80 表 / `/health` 200；
+  新 `0.9.0` **同一数据目录**启动 ⇒ `(52,0)` / 90 表 / 日志 `Database migrated from version 34 to 52` /
+  无 `Database migration failed` ⇒ **PASS**。上游 sqlite 迁移 **+18 条**（`000035`…`000052`），均为纯新增
+  （既有迁移无改动/删除）。
+- **上游本批主题**（与本车道无重叠）：automations、agent grants/collaborations、credential vault、Feishu 深适配、
+  MCP tool risk、session kind/owner auth source、sandbox user allocation；新增依赖 `goldmark` / `xlsReader` / `fmtdate`，
+  Go `1.26.0` 与构建标签不变。
+- **候选分支**：本机 `sync/upstream-0.9.0`（合并提交 + 本文件），**未推 fork、未改 Solo 主仓 gitlink**；合入动作待拍板。
+
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
 > 与「产物事实」的分工：上方已拍板**产物事实只在发布侧记一处**（每构建就变的数字）；本台账记的是
@@ -129,6 +159,7 @@
 | 2026-09-22 | —（无同步；**门禁启用首跑**） | — | ~0.5 | ✓ `go build ./...` + 车道用例全绿（types/agent/agent.tools/handler/service，门禁 116s） | 阈值累计自此行开始 |
 | 2026-09-26 | `aaec920a` → `9fcc2c67`（186 commit / 1733 文件） | **≈483**（5 处：service 95 + 其测试 362 + container 4 + handler 10 + types 12；**其中 457 行是"上游已收编 ⇒ 整文件取上游"**，真需人工判断的仅 ~26 行） | ~1.5 | ✓ `go build ./...` + 车道用例全绿（129s）；产物冒烟 253M | 见上方同步记录；**车道净减 2 项**（E1/`enable_rerank` 被上游收编） |
 | 2026-10-11 | `9fcc2c67` → `150d8cc60`（175 commit） | 0（全自动） | ~0.5 | ✓ `go build ./...` + 车道用例全绿（Solo 侧 311s；构建侧 win 236s / linux 547s） | 见上方同步记录；0.8.7 产物双平台 + 升级演练 PASS（33→34） |
+| 2026-11-10 | `150d8cc60` → `cbdcebab`（568 commit / 2775 文件） | 1 处（`router.go` 6 行；另有 1 处测试签名编译错 `operations_test.go`） | ~1 | ✓ `go build ./...` + 车道用例（462s）；`go test -run '^$' ./internal/...` 全测试包编译 ✓；router / 问数端点用例 ✓ | **候选分支**（待拍板）；上游 0.9.0；sqlite +18 迁移；升级演练 34→52 PASS |
 
 ## 为什么需要本车道（但源码改动很少）
 
