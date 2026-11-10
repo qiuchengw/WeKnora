@@ -13,9 +13,11 @@ import { updateMyPreferences } from '@/api/auth'
 import EmptyState from '@/components/EmptyState.vue'
 import { galleryImageRequest } from './galleryImageSrc'
 import GalleryViewer, { type GalleryAttrRow } from './GalleryViewer.vue'
+import GallerySourcePicker from './GallerySourcePicker.vue'
 
 const props = defineProps<{
   knowledgeBaseId: string
+  canEdit?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -32,8 +34,10 @@ const loading = ref(false)
 const error = ref('')
 const items = ref<ImageAsset[]>([])
 const total = ref(0)
-const page = ref(1)
-const pageSize = ref(24)
+const page = ref(0)
+const pageSize = 24
+const exhausted = ref(false)
+const hasMore = computed(() => !exhausted.value && page.value * pageSize < total.value)
 
 const keyword = ref('')
 const sortBy = ref('')
@@ -42,6 +46,17 @@ const sortOrder = ref<'asc' | 'desc'>('desc')
 const filterPanelVisible = ref(false)
 const sortPanelVisible = ref(false)
 const scrollEl = ref<HTMLElement | null>(null)
+const gridEl = ref<HTMLElement | null>(null)
+const loadMoreEl = ref<HTMLElement | null>(null)
+const imageRatios = ref<Record<string, number>>({})
+let cardObserver: ResizeObserver | undefined
+let scrollObserver: ResizeObserver | undefined
+
+// Source-document restriction (the "filter by document" picker). An empty
+// array means every document of the KB; otherwise only images whose owning
+// document is listed are fetched. Edited from the toolbar's source panel.
+const sourceDocIds = ref<string[]>([])
+const sourcePickerVisible = ref(false)
 
 // Attribute selections for free-text ("keywords") attributes: namespaced attr
 // id -> literal values (OR within the attribute, AND across attributes).
@@ -100,6 +115,12 @@ const blobByRawUrl = new Map<string, string>()
 // Fetches in flight, so the grid and the viewer asking for the same image at
 // once share one request.
 const inflight = new Map<string, Promise<string>>()
+let imageRequests = new AbortController()
+
+function abortImageRequests(): void {
+  imageRequests.abort()
+  inflight.clear()
+}
 
 /** Revoke every cached object URL whose raw URL is not in keep. */
 function releaseBlobs(keep: Set<string> = new Set()): void {
@@ -110,13 +131,17 @@ function releaseBlobs(keep: Set<string> = new Set()): void {
   }
 }
 
-async function fetchBlobUrl(rawUrl: string): Promise<string> {
+async function fetchBlobUrl(rawUrl: string, signal: AbortSignal): Promise<string> {
   const req = galleryImageRequest(rawUrl, props.knowledgeBaseId)
   if (!req) return rawUrl
   try {
-    const resp = await fetch(req.url, { headers: req.headers })
-    if (!resp.ok) return rawUrl
-    const objectUrl = URL.createObjectURL(await resp.blob())
+    const resp = await fetch(req.url, { headers: req.headers, signal })
+    if (!resp.ok || signal.aborted) return rawUrl
+    const blob = await resp.blob()
+    // Cancellation can race with a completed body read. Never create a URL
+    // after this query's cleanup, even if the response ignored the abort.
+    if (signal.aborted) return rawUrl
+    const objectUrl = URL.createObjectURL(blob)
     blobByRawUrl.set(rawUrl, objectUrl)
     return objectUrl
   } catch {
@@ -125,29 +150,60 @@ async function fetchBlobUrl(rawUrl: string): Promise<string> {
 }
 
 function resolveImageSrc(rawUrl: string): Promise<string> {
+  if (imageRequests.signal.aborted) return Promise.resolve(rawUrl)
   const cached = blobByRawUrl.get(rawUrl)
   if (cached) return Promise.resolve(cached)
   let pending = inflight.get(rawUrl)
   if (!pending) {
-    pending = fetchBlobUrl(rawUrl).finally(() => inflight.delete(rawUrl))
+    pending = fetchBlobUrl(rawUrl, imageRequests.signal).finally(() => {
+      // A newer query may already have started the same URL's replacement.
+      if (inflight.get(rawUrl) === pending) inflight.delete(rawUrl)
+    })
     inflight.set(rawUrl, pending)
   }
   return pending
 }
 
-async function resolveThumbnails(token: number) {
-  const imgs = items.value
-  const urls = await Promise.all(imgs.map((img) => resolveImageSrc(img.url)))
-  // A newer listing owns the grid now; its own pass maps the thumbnails.
-  if (token !== listToken) return
-  const next: Record<string, string> = {}
-  imgs.forEach((img, i) => {
-    next[img.id] = urls[i]
+async function resolveThumbnails(imgs: ImageAsset[], token: number) {
+  await Promise.all(imgs.map(async (img) => {
+    const url = await resolveImageSrc(img.url)
+    if (token !== listToken) return
+    thumbUrls.value[img.id] = url
+  }))
+  if (token === listToken) releaseBlobs(new Set(items.value.map((img) => img.url)))
+}
+
+function onThumbLoad(id: string, event: Event) {
+  const image = event.target as HTMLImageElement
+  if (image.naturalWidth && image.naturalHeight) {
+    imageRatios.value[id] = image.naturalWidth / image.naturalHeight
+  }
+}
+
+// Keep DOM order (and keyboard/viewer order) while cards span only the rows
+// their natural image height needs. Existing cards stay put when appending.
+function sizeCards(cards: HTMLElement[]) {
+  const spans = cards.map((card) => Math.ceil((card.getBoundingClientRect().height + 12) / 13))
+  cards.forEach((card, index) => {
+    card.style.gridRowEnd = `span ${spans[index]}`
   })
-  // Revoke blob URLs that are no longer on screen to avoid leaks.
-  releaseBlobs(new Set(imgs.map((img) => img.url)))
-  thumbUrls.value = next
-  thumbBroken.value = {}
+}
+
+function observeCards() {
+  cardObserver?.disconnect()
+  const cards = Array.from(gridEl.value?.querySelectorAll<HTMLElement>('.ig-card') ?? [])
+  sizeCards(cards)
+  cards.forEach((card) => cardObserver?.observe(card))
+}
+
+function checkLoadMore() {
+  if (loading.value || error.value || viewerOpen.value || !hasMore.value) return
+  const scroll = scrollEl.value
+  const sentinel = loadMoreEl.value
+  if (scroll && sentinel && scroll.clientHeight > 0 &&
+      sentinel.getBoundingClientRect().top <= scroll.getBoundingClientRect().bottom + 300) {
+    void loadMore()
+  }
 }
 
 function onThumbError(id: string) {
@@ -176,6 +232,15 @@ function onThumbError(id: string) {
 const ATTR_NAMESPACE = 'knowledgeEditor.wikiBrowser.gallery.attr'
 
 const sanitizeKey = (id: string) => id.replace(/[:.]/g, '_')
+
+const IMAGE_SOURCE_PAGE_ATTR = 'source.page'
+const IMAGE_SOURCE_INDEX_ATTR = 'source.image_index'
+
+/** 解析器页码从 1 开始；旧数据或非法属性不展示页码。 */
+function imagePage(img: ImageAsset): number | null {
+  const page = img.attrs?.[IMAGE_SOURCE_PAGE_ATTR]
+  return typeof page === 'number' && Number.isSafeInteger(page) && page > 0 ? page : null
+}
 
 /** The pipeline's own wording for an attribute, keyed by its source-local name. */
 function pipelineKey(attr: GalleryResolvedAttr, suffix = ''): string {
@@ -275,7 +340,8 @@ const isNarrowed = computed(
   () =>
     !!keyword.value.trim() ||
     Object.keys(activeRules.value).length > 0 ||
-    Object.keys(activeSelections.value).length > 0,
+    Object.keys(activeSelections.value).length > 0 ||
+    sourceDocIds.value.length > 0,
 )
 
 function verdictOf(attrId: string, value: string): Verdict {
@@ -288,7 +354,7 @@ function setVerdict(attrId: string, value: string, verdict: Verdict): void {
   if (verdict === 'default') delete perValue[value]
   else perValue[value] = verdict
   attrVerdicts.value = { ...attrVerdicts.value, [attrId]: perValue }
-  resetPageAndReload()
+  reload()
 }
 
 function verdictLabel(v: Verdict): string {
@@ -303,7 +369,7 @@ function onKeywordsInput(attrId: string, raw: string) {
     .map((s) => s.trim())
     .filter(Boolean)
   attrSelections.value = { ...attrSelections.value, [attrId]: values }
-  resetPageAndReload()
+  reload()
 }
 
 function keywordsInputValue(attrId: string): string {
@@ -318,13 +384,23 @@ function clearFilters(): void {
     searchMode.value = 'all'
     persistSearchPrefs()
   }
-  resetPageAndReload()
+  reload()
 }
 
-/** The empty state's way back: forget the keyword as well. */
+/** The empty state's way back: forget the keyword and source documents as well. */
 function clearAll(): void {
+  if (sourceTimer) clearTimeout(sourceTimer)
   keyword.value = ''
+  sourceDocIds.value = []
   clearFilters()
+}
+
+/** Ticked in the source panel: restrict the listing to these documents. */
+let sourceTimer: ReturnType<typeof setTimeout> | undefined
+function onSourceDocsChange(ids: string[]): void {
+  sourceDocIds.value = ids
+  if (sourceTimer) clearTimeout(sourceTimer)
+  sourceTimer = setTimeout(() => reload(), 300)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +430,7 @@ function onSearchFieldToggle(attrId: string, checked: boolean) {
   searchStatus.value = next
   searchMode.value = on.size === searchAttrs.value.length ? 'all' : 'custom'
   persistSearchPrefs()
-  if (keyword.value.trim()) resetPageAndReload()
+  if (keyword.value.trim()) reload()
 }
 
 function isLastSearchField(attrId: string): boolean {
@@ -373,13 +449,13 @@ const sortFieldLabel = computed(() => {
 function selectSortField(id: string): void {
   if (sortBy.value === id) return
   sortBy.value = id
-  resetPageAndReload()
+  reload()
 }
 
 function selectSortOrder(order: 'asc' | 'desc'): void {
   if (sortOrder.value === order) return
   sortOrder.value = order
-  resetPageAndReload()
+  reload()
 }
 
 // ---------------------------------------------------------------------------
@@ -395,69 +471,79 @@ function buildParams(): ImageListParams {
     sortOrder: sortOrder.value,
     attrFilters: Object.keys(selections).length ? selections : undefined,
     attrRules: Object.keys(rules).length ? rules : undefined,
-    page: page.value,
-    pageSize: pageSize.value,
+    knowledgeIds: sourceDocIds.value.length ? sourceDocIds.value : undefined,
+    pageSize,
   }
 }
 
-// Bumped by every listing, so a slower earlier response (a debounced search
-// overtaken by a page change) cannot overwrite the grid of a newer query.
+// A query owns all of its appended pages; stale responses cannot replace it.
 let listToken = 0
+let queryParams: ImageListParams = {}
 
-/**
- * Fetch the current page. `focus` is where the viewer lands on the new page
- * when it walked past a page edge; it is applied together with the new items
- * so the viewer never renders a stale index against them.
- */
-async function reload(focus?: 'first' | 'last') {
-  if (!props.knowledgeBaseId) return
-  const token = ++listToken
+async function fetchNextPage(): Promise<boolean> {
+  if (!props.knowledgeBaseId) return false
+  const token = listToken
+  const nextPage = page.value + 1
   loading.value = true
   error.value = ''
   try {
-    const res = await listGalleryImages(props.knowledgeBaseId, buildParams())
-    if (token !== listToken) return
-    items.value = res.items
+    const res = await listGalleryImages(props.knowledgeBaseId, { ...queryParams, page: nextPage })
+    if (token !== listToken) return false
+    const existing = new Set(items.value.map((img) => img.id))
+    const incoming = res.items.filter((img) => !existing.has(img.id))
+    items.value.push(...incoming)
+    page.value = nextPage
     total.value = res.total
-    if (focus && res.items.length) viewerIndex.value = focus === 'first' ? 0 : res.items.length - 1
-    else if (viewerOpen.value && viewerIndex.value >= res.items.length) closeViewer()
-    void resolveThumbnails(token)
+    exhausted.value = res.items.length === 0
+    void resolveThumbnails(incoming, token)
+    await nextTick()
+    observeCards()
+    return true
   } catch (e) {
-    if (token !== listToken) return
-    error.value = e instanceof Error ? e.message : String(e)
-    items.value = []
-    total.value = 0
-    thumbUrls.value = {}
-    closeViewer()
+    if (token === listToken) error.value = e instanceof Error ? e.message : String(e)
+    return false
   } finally {
-    if (token === listToken) loading.value = false
+    if (token === listToken) {
+      loading.value = false
+      void nextTick(checkLoadMore)
+    }
   }
 }
 
-function resetPageAndReload() {
-  page.value = 1
-  scrollGridToTop()
-  reload()
+function loadMore(): Promise<boolean> {
+  if (loading.value || !hasMore.value) return Promise.resolve(false)
+  return fetchNextPage()
 }
 
-function scrollGridToTop() {
+function resetResults() {
+  listToken++
+  abortImageRequests()
+  imageRequests = new AbortController()
+  viewerOpen.value = false
+  items.value = []
+  total.value = 0
+  page.value = 0
+  exhausted.value = false
+  thumbUrls.value = {}
+  thumbBroken.value = {}
+  imageRatios.value = {}
   scrollEl.value?.scrollTo({ top: 0 })
+}
+
+function reload() {
+  resetResults()
+  queryParams = buildParams()
+  return fetchNextPage()
 }
 
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 function onSearchInput() {
   if (searchTimer) clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => resetPageAndReload(), 350)
+  searchTimer = setTimeout(() => reload(), 350)
 }
 
 function onSearchNow() {
   if (searchTimer) clearTimeout(searchTimer)
-  resetPageAndReload()
-}
-
-function onPageChange(next: number) {
-  page.value = next
-  scrollGridToTop()
   reload()
 }
 
@@ -475,7 +561,7 @@ function openViewer(index: number) {
 function closeViewer() {
   if (!viewerOpen.value) return
   viewerOpen.value = false
-  // The viewer may have walked onto another image, or another page; bring
+  // The viewer may have walked onto another image; bring
   // the card it stopped on into view so the grid picks up where it left off.
   const index = viewerIndex.value
   void nextTick(() => {
@@ -485,12 +571,13 @@ function closeViewer() {
   })
 }
 
-/** The viewer walked past the edge of this page: load the neighbour. */
-async function onViewerStep(delta: 1 | -1) {
-  const target = page.value + delta
-  if (target < 1 || (target - 1) * pageSize.value >= total.value) return
-  page.value = target
-  await reload(delta > 0 ? 'first' : 'last')
+/** At the loaded edge, append the next batch and keep the viewer continuous. */
+async function onViewerLoadMore() {
+  const token = listToken
+  const nextIndex = items.value.length
+  if (await loadMore() && token === listToken && viewerOpen.value && items.value.length > nextIndex) {
+    viewerIndex.value = nextIndex
+  }
 }
 
 function onOpenSource(knowledgeId: string) {
@@ -499,7 +586,12 @@ function onOpenSource(knowledgeId: string) {
 }
 
 function attrRows(img: ImageAsset): GalleryAttrRow[] {
-  return Object.entries(img.attrs || {}).map(([name, raw]) => {
+  // 原文序号仅供稳定排序；页码用用户可读的名称展示，避免泄露内部属性键。
+  return Object.entries(img.attrs || {}).filter(([name]) => name !== IMAGE_SOURCE_INDEX_ATTR
+    && (name !== IMAGE_SOURCE_PAGE_ATTR || imagePage(img) !== null)).map(([name, raw]) => {
+    if (name === IMAGE_SOURCE_PAGE_ATTR) {
+      return { key: name, label: t(`${NS}.attr.builtin_page`), value: String(imagePage(img)) }
+    }
     const attr = findAttrByRawName(name)
     return {
       key: name,
@@ -518,14 +610,19 @@ function sourceLabel(img: ImageAsset): string {
 // ---------------------------------------------------------------------------
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
+  if (sourceTimer) clearTimeout(sourceTimer)
   // Orphan any in-flight listing so it cannot map new blobs after unmount.
   listToken++
+  initToken++
+  abortImageRequests()
+  cardObserver?.disconnect()
+  scrollObserver?.disconnect()
   releaseBlobs()
 })
 
-// Newest first unless the contract no longer offers it; picking by id keeps
-// the default independent of source registration order.
-const DEFAULT_SORT_ID = 'builtin:created_at'
+// 按字段 ID 选择页码升序；未开放页码排序时回退创建时间降序。
+const DEFAULT_SORT_ID = 'builtin:page'
+const LEGACY_DEFAULT_SORT_ID = 'builtin:created_at'
 
 let initToken = 0
 
@@ -534,16 +631,17 @@ let initToken = 0
 // everything scoped to the previous knowledge base is dropped first.
 async function initGallery() {
   const token = ++initToken
-  viewerOpen.value = false
-  items.value = []
-  total.value = 0
-  page.value = 1
+  resetResults()
+  if (searchTimer) clearTimeout(searchTimer)
+  if (sourceTimer) clearTimeout(sourceTimer)
+  error.value = ''
   keyword.value = ''
   sortBy.value = ''
+  sortOrder.value = 'desc'
   attrSelections.value = {}
   attrVerdicts.value = {}
-  thumbUrls.value = {}
-  thumbBroken.value = {}
+  sourceDocIds.value = []
+  sourcePickerVisible.value = false
   releaseBlobs()
   configLoaded.value = false
   config.value = { attribute_sources: [], attributes: [], mode: 'all', status: {} }
@@ -561,12 +659,28 @@ async function initGallery() {
     // default search still work.
   }
   if (!sortBy.value && sortAttrs.value.length) {
-    sortBy.value = sortAttrs.value.find((a) => a.id === DEFAULT_SORT_ID)?.id ?? sortAttrs.value[0].id
+    // 页码是画廊显式选择的默认排序；未开放该能力时保留创建时间降序。
+    sortBy.value = sortAttrs.value.find((a) => a.id === DEFAULT_SORT_ID)?.id
+      ?? sortAttrs.value.find((a) => a.id === LEGACY_DEFAULT_SORT_ID)?.id
+      ?? sortAttrs.value[0].id
+    sortOrder.value = sortBy.value === DEFAULT_SORT_ID ? 'asc' : 'desc'
   }
   await reload()
 }
 
-onMounted(initGallery)
+onMounted(() => {
+  cardObserver = new ResizeObserver((entries) => {
+    sizeCards(entries.map((entry) => entry.target as HTMLElement))
+    void nextTick(checkLoadMore)
+  })
+  scrollObserver = new ResizeObserver(checkLoadMore)
+  if (scrollEl.value) scrollObserver.observe(scrollEl.value)
+  void initGallery()
+})
+
+watch(viewerOpen, (open) => {
+  if (!open) void nextTick(checkLoadMore)
+})
 
 watch(
   () => props.knowledgeBaseId,
@@ -601,6 +715,33 @@ watch(
         >
           <template #prefix-icon><t-icon name="search" size="16px" /></template>
         </t-input>
+
+        <t-popup
+          v-model:visible="sourcePickerVisible"
+          trigger="click"
+          placement="bottom-right"
+          overlay-class-name="gallery-toolbar-popup"
+          :overlay-inner-style="{ padding: 0 }"
+        >
+          <button
+            type="button"
+            class="ig-tool-btn"
+            :class="{ active: sourcePickerVisible || sourceDocIds.length > 0 }"
+            :aria-expanded="sourcePickerVisible"
+          >
+            <t-icon name="file" size="16px" />
+            {{ t(`${NS}.sourceFilter`) }}
+            <span v-if="sourceDocIds.length" class="ig-tool-btn__count">{{ sourceDocIds.length }}</span>
+          </button>
+          <template #content>
+            <GallerySourcePicker
+              :kb-id="props.knowledgeBaseId"
+              :visible="sourcePickerVisible"
+              :selected="sourceDocIds"
+              @update:selected="onSourceDocsChange"
+            />
+          </template>
+        </t-popup>
 
         <t-popup
           v-model:visible="filterPanelVisible"
@@ -759,9 +900,12 @@ watch(
       </div>
     </div>
 
-    <div ref="scrollEl" class="ig-scroll" :class="{ 'is-empty': !items.length }">
-      <t-loading :loading="loading" size="small" class="ig-loading">
-        <div v-if="error" class="ig-error">{{ error }}</div>
+    <div ref="scrollEl" class="ig-scroll" :class="{ 'is-empty': !items.length }" @scroll.passive="checkLoadMore">
+      <t-loading :loading="loading && !items.length" size="small" class="ig-loading">
+        <div v-if="error && !items.length" class="ig-error" role="alert">
+          {{ error }}
+          <t-button variant="text" @click="reload">{{ t('common.retry') }}</t-button>
+        </div>
 
         <EmptyState
           v-else-if="!items.length && !loading"
@@ -772,7 +916,7 @@ watch(
           <t-button v-if="isNarrowed" variant="outline" @click="clearAll">{{ t(`${NS}.clearFilters`) }}</t-button>
         </EmptyState>
 
-        <div v-else class="ig-grid">
+        <div v-else ref="gridEl" class="ig-grid">
           <button
             v-for="(img, idx) in items"
             :key="img.id"
@@ -781,19 +925,23 @@ watch(
             :class="{ 'is-disabled': !img.is_enabled }"
             @click="openViewer(idx)"
           >
-            <div class="ig-card__thumb">
+            <div class="ig-card__thumb" :style="{ aspectRatio: imageRatios[img.id] || 4 / 3 }">
               <img
                 v-if="thumbUrls[img.id] && !thumbBroken[img.id]"
                 :src="thumbUrls[img.id]"
                 :alt="img.caption"
                 loading="lazy"
                 draggable="false"
+                @load="onThumbLoad(img.id, $event)"
                 @error="onThumbError(img.id)"
               />
               <div v-else-if="thumbBroken[img.id]" class="ig-card__broken">
                 <t-icon name="image-error" size="20px" />
                 <span>{{ t(`${NS}.imageLoadError`) }}</span>
               </div>
+              <span v-if="imagePage(img) !== null" class="ig-card__page">
+                {{ t(`${NS}.sourcePage`, { page: imagePage(img) }) }}
+              </span>
               <span v-if="!img.is_enabled" class="ig-card__badge">
                 {{ t(`${NS}.attr.builtin_is_enabled_value_false`) }}
               </span>
@@ -803,41 +951,39 @@ watch(
                 {{ img.caption || t(`${NS}.noCaption`) }}
               </div>
               <div class="ig-card__source" :title="sourceLabel(img)">
-                <t-icon name="file" size="12px" />
+                <t-icon name="file" size="14px" />
                 <span>{{ sourceLabel(img) }}</span>
               </div>
             </div>
           </button>
         </div>
       </t-loading>
-    </div>
-
-    <div v-if="total > pageSize" class="ig-footer">
-      <t-pagination
-        :total="total"
-        :page-size="pageSize"
-        :current="page"
-        :show-page-size="false"
-        :total-content="false"
-        size="small"
-        @current-change="onPageChange"
-      />
+      <div v-if="items.length" ref="loadMoreEl" class="ig-load-more" aria-live="polite">
+        <template v-if="error">
+          <span class="ig-error" role="alert">{{ error }}</span>
+          <t-button variant="text" @click="loadMore">{{ t('common.retry') }}</t-button>
+        </template>
+        <t-loading v-else-if="loading" size="small" :text="t('common.loading')" />
+        <t-button v-else-if="hasMore" variant="text" @click="loadMore">{{ t('common.loadMore') }}</t-button>
+        <span v-else>{{ t('common.noMoreData') }}</span>
+      </div>
     </div>
 
     <GalleryViewer
       v-if="viewerOpen && items.length"
       :items="items"
       :index="viewerIndex"
-      :offset="(page - 1) * pageSize"
       :total="total"
       :loading="loading"
       :thumb-urls="thumbUrls"
       :resolve-src="resolveImageSrc"
       :attr-rows="attrRows"
+      :can-edit="props.canEdit"
       @select="(i: number) => (viewerIndex = i)"
-      @step="onViewerStep"
+      @load-more="onViewerLoadMore"
       @close="closeViewer"
       @open-source="onOpenSource"
+      @saved="closeViewer(); reload()"
     />
   </div>
 </template>
@@ -1176,9 +1322,10 @@ watch(
 }
 
 .ig-loading {
-  min-height: 100%;
   display: flex;
   flex-direction: column;
+
+  .is-empty & { min-height: 100%; }
 }
 
 .ig-error {
@@ -1189,7 +1336,9 @@ watch(
 .ig-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  grid-auto-rows: 1px;
   gap: 12px;
+  align-items: start;
   align-content: start;
 }
 
@@ -1225,7 +1374,7 @@ watch(
 
   &__thumb {
     position: relative;
-    aspect-ratio: 4 / 3;
+    width: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1235,7 +1384,7 @@ watch(
     img {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: contain;
       transition: transform var(--app-motion-slow) ease;
     }
   }
@@ -1249,6 +1398,18 @@ watch(
     color: var(--td-text-color-placeholder);
     font-size: var(--app-text-sm);
     text-align: center;
+  }
+
+  &__page {
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6);
+    font-size: var(--app-text-sm);
+    pointer-events: none;
   }
 
   &__badge {
@@ -1291,6 +1452,8 @@ watch(
     color: var(--td-text-color-placeholder);
     font-size: var(--app-text-sm);
 
+    .t-icon { flex-shrink: 0; }
+
     span {
       min-width: 0;
       overflow: hidden;
@@ -1300,12 +1463,15 @@ watch(
   }
 }
 
-.ig-footer {
+.ig-load-more {
   display: flex;
-  justify-content: flex-end;
-  flex-shrink: 0;
-  padding: 12px 0 16px;
-  border-top: 1px solid var(--td-component-stroke);
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 16px 0;
+  color: var(--td-text-color-placeholder);
+  font-size: var(--app-text-sm);
 }
 
 @container image-gallery (max-width: 780px) {

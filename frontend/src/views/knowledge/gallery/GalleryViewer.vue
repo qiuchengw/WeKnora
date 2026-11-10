@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import type { ImageAsset } from '@/api/image-gallery'
 import { copyWithToast } from '@/utils/clipboard'
 import { renderDocumentPreviewMarkdown } from '@/utils/documentPreviewMarkdown'
+import ImageEvidenceEditor from './ImageEvidenceEditor.vue'
 
 export interface GalleryAttrRow {
   key: string
@@ -12,46 +13,44 @@ export interface GalleryAttrRow {
 }
 
 const props = defineProps<{
-  /** The images of the page on screen; the viewer walks them in order. */
+  /** The loaded images; the viewer walks them in order. */
   items: ImageAsset[]
   index: number
-  /** Position of items[0] in the whole result set, so the counter and the
-   *  prev/next bounds speak about every image, not just this page. */
-  offset: number
   total: number
-  /** A neighbouring page is being fetched; navigation waits for it. */
+  /** More images are being fetched; navigation waits for them. */
   loading: boolean
   thumbUrls: Record<string, string>
   resolveSrc: (url: string) => Promise<string>
   attrRows: (img: ImageAsset) => GalleryAttrRow[]
+  canEdit?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'select', index: number): void
-  /** Step past the page edge; the gallery loads the neighbouring page. */
-  (e: 'step', delta: 1 | -1): void
+  /** Step past the loaded edge; the gallery loads more images. */
+  (e: 'load-more'): void
   (e: 'open-source', knowledgeId: string): void
+  (e: 'saved'): void
 }>()
 
 const NS = 'knowledgeEditor.wikiBrowser.gallery'
 const { t, locale } = useI18n()
 
 const current = computed<ImageAsset | null>(() => props.items[props.index] ?? null)
-const position = computed(() => props.offset + props.index + 1)
+const position = computed(() => props.index + 1)
 const hasPrev = computed(() => position.value > 1)
 const hasNext = computed(() => position.value < props.total)
 
 function prev(): void {
   if (props.loading || !hasPrev.value) return
-  if (props.index > 0) emit('select', props.index - 1)
-  else emit('step', -1)
+  emit('select', props.index - 1)
 }
 
 function next(): void {
   if (props.loading || !hasNext.value) return
   if (props.index < props.items.length - 1) emit('select', props.index + 1)
-  else emit('step', 1)
+  else emit('load-more')
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +275,8 @@ const ocrHtml = computed(() => renderDocumentPreviewMarkdown(current.value?.ocr_
 const sectionId = useId()
 const captionExpanded = ref(true)
 const ocrExpanded = ref(true)
+const captionEditor = ref<InstanceType<typeof ImageEvidenceEditor> | null>(null)
+const ocrEditor = ref<InstanceType<typeof ImageEvidenceEditor> | null>(null)
 watch(() => current.value?.id, () => {
   captionExpanded.value = true
   ocrExpanded.value = true
@@ -431,7 +432,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
             type="button"
             class="igv-strip__item"
             :class="{ 'is-current': i === index }"
-            :aria-label="img.caption || String(offset + i + 1)"
+            :aria-label="img.caption || String(i + 1)"
             @click="emit('select', i)"
           >
             <img v-if="thumbUrls[img.id]" :src="thumbUrls[img.id]" alt="" draggable="false" />
@@ -455,13 +456,29 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
                   <t-icon :name="captionExpanded ? 'chevron-down' : 'chevron-right'" size="14px" aria-hidden="true" />
                 </button>
               </h3>
-              <button v-if="current.caption" type="button" class="igv-copy" :title="t(`${NS}.copy`)" :aria-label="`${t(`${NS}.copy`)} ${t(`${NS}.caption`)}`" @click="copyText(current.caption)">
-                <t-icon name="file-copy" size="14px" aria-hidden="true" />
-              </button>
+              <div v-if="current.caption" class="igv-section__actions">
+                <button
+                  v-if="canEdit"
+                  type="button"
+                  class="igv-section-action"
+                  :title="t('common.edit')"
+                  :aria-label="`${t('common.edit')} ${t(`${NS}.caption`)}`"
+                  :disabled="captionEditor?.editing"
+                  @click="captionExpanded = true; captionEditor?.beginEdit()"
+                >
+                  <t-icon name="edit" size="14px" aria-hidden="true" />
+                </button>
+                <button type="button" class="igv-section-action" :title="t(`${NS}.copy`)" :aria-label="`${t(`${NS}.copy`)} ${t(`${NS}.caption`)}`" @click="copyText(current.caption)">
+                  <t-icon name="file-copy" size="14px" aria-hidden="true" />
+                </button>
+              </div>
             </div>
             <div v-show="captionExpanded" :id="`${sectionId}-caption`">
-              <div v-if="current.caption" class="igv-markdown" v-html="captionHtml" />
-              <p v-else class="igv-text is-muted">{{ t(`${NS}.noCaption`) }}</p>
+              <template v-if="!captionEditor?.editing">
+                <div v-if="current.caption" class="igv-markdown" v-html="captionHtml" />
+                <p v-else class="igv-text is-muted">{{ t(`${NS}.noCaption`) }}</p>
+              </template>
+              <ImageEvidenceEditor v-if="canEdit && current.caption" ref="captionEditor" :image="current" field="caption" @saved="emit('saved')" />
             </div>
           </section>
 
@@ -479,13 +496,29 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
                   <t-icon :name="ocrExpanded ? 'chevron-down' : 'chevron-right'" size="14px" aria-hidden="true" />
                 </button>
               </h3>
-              <button v-if="current.ocr_text" type="button" class="igv-copy" :title="t(`${NS}.copy`)" :aria-label="`${t(`${NS}.copy`)} ${t(`${NS}.ocr`)}`" @click="copyText(current.ocr_text)">
-                <t-icon name="file-copy" size="14px" aria-hidden="true" />
-              </button>
+              <div v-if="current.ocr_text" class="igv-section__actions">
+                <button
+                  v-if="canEdit"
+                  type="button"
+                  class="igv-section-action"
+                  :title="t('common.edit')"
+                  :aria-label="`${t('common.edit')} ${t(`${NS}.ocr`)}`"
+                  :disabled="ocrEditor?.editing"
+                  @click="ocrExpanded = true; ocrEditor?.beginEdit()"
+                >
+                  <t-icon name="edit" size="14px" aria-hidden="true" />
+                </button>
+                <button type="button" class="igv-section-action" :title="t(`${NS}.copy`)" :aria-label="`${t(`${NS}.copy`)} ${t(`${NS}.ocr`)}`" @click="copyText(current.ocr_text)">
+                  <t-icon name="file-copy" size="14px" aria-hidden="true" />
+                </button>
+              </div>
             </div>
             <div v-show="ocrExpanded" :id="`${sectionId}-ocr`">
-              <div v-if="current.ocr_text" class="igv-markdown" v-html="ocrHtml" />
-              <p v-else class="igv-text is-muted">{{ t(`${NS}.noOcr`) }}</p>
+              <template v-if="!ocrEditor?.editing">
+                <div v-if="current.ocr_text" class="igv-markdown" v-html="ocrHtml" />
+                <p v-else class="igv-text is-muted">{{ t(`${NS}.noOcr`) }}</p>
+              </template>
+              <ImageEvidenceEditor v-if="canEdit && current.ocr_text" ref="ocrEditor" :image="current" field="ocr_text" @saved="emit('saved')" />
             </div>
           </section>
 
@@ -833,6 +866,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
   &.is-collapsed > &__head { margin-bottom: 0; }
 
+  &__actions {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 2px;
+  }
+
   &__toggle {
     display: flex;
     align-items: center;
@@ -855,7 +895,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   }
 }
 
-.igv-copy {
+.igv-section-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -871,9 +911,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   font-size: var(--app-text-sm);
   cursor: pointer;
 
-  &:hover {
+  &:hover:not(:disabled) {
     color: var(--td-brand-color);
     background: var(--td-bg-color-container-hover);
+  }
+
+  &:disabled {
+    color: var(--td-text-color-disabled);
+    cursor: default;
   }
 
   &:focus-visible { outline: 2px solid var(--app-focus-border); outline-offset: 2px; }

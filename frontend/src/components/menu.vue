@@ -7,6 +7,10 @@
                 <sup v-if="isLiteEdition" class="lite-badge">Lite</sup>
             </div>
             <div class="logo_actions">
+                <t-tooltip v-if="assistantStore.entry === 'sidebar'" :content="assistantName" placement="bottom">
+                    <AssistantButton data-guide="assistant-entry" icon-only :icon-size="18" :label="assistantName"
+                        :active="assistantStore.visible" @click="assistantStore.toggle()" />
+                </t-tooltip>
                 <t-tooltip placement="bottom">
                     <template #content>
                         <span class="cmdk-tip">
@@ -20,10 +24,10 @@
                     </div>
                 </t-tooltip>
                 <div class="sidebar-toggle" @click="uiStore.toggleSidebar" :title="t('menu.collapseSidebar')">
-                    <svg viewBox="0 0 20 20" width="18" height="18" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <rect x="1.5" y="1.5" width="17" height="17" rx="3" stroke="currentColor" stroke-width="1.2" />
-                        <line x1="7.5" y1="1.5" x2="7.5" y2="18.5" stroke="currentColor" stroke-width="1.2" />
-                        <line x1="4" y1="7.5" x2="4" y2="12.5" stroke="currentColor" stroke-width="1.2"
+                    <svg viewBox="0 0 20 20" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="1.5" y="1.5" width="17" height="17" rx="3" stroke="currentColor" stroke-width="1.5" />
+                        <line x1="7.5" y1="1.5" x2="7.5" y2="18.5" stroke="currentColor" stroke-width="1.5" />
+                        <line x1="4" y1="7.5" x2="4" y2="12.5" stroke="currentColor" stroke-width="1.5"
                             stroke-linecap="round" />
                     </svg>
                 </div>
@@ -34,14 +38,14 @@
             <div class="menu_item sidebar-toggle-item" @click="uiStore.toggleSidebar">
                 <div class="menu_item-box">
                     <div class="menu_icon">
-                        <svg class="icon" viewBox="0 0 20 20" width="20" height="20" fill="none"
+                        <svg class="icon icon--toggle" viewBox="0 0 20 20" width="16" height="16" fill="none"
                             xmlns="http://www.w3.org/2000/svg">
                             <rect x="1.5" y="1.5" width="17" height="17" rx="3" stroke="currentColor"
-                                stroke-width="1.2" />
-                            <line x1="7.5" y1="1.5" x2="7.5" y2="18.5" stroke="currentColor" stroke-width="1.2" />
-                            <line x1="5" y1="10" x2="3" y2="8" stroke="currentColor" stroke-width="1.2"
+                                stroke-width="1.5" />
+                            <line x1="7.5" y1="1.5" x2="7.5" y2="18.5" stroke="currentColor" stroke-width="1.5" />
+                            <line x1="5" y1="10" x2="3" y2="8" stroke="currentColor" stroke-width="1.5"
                                 stroke-linecap="round" />
-                            <line x1="5" y1="10" x2="3" y2="12" stroke="currentColor" stroke-width="1.2"
+                            <line x1="5" y1="10" x2="3" y2="12" stroke="currentColor" stroke-width="1.5"
                                 stroke-linecap="round" />
                         </svg>
                     </div>
@@ -77,6 +81,10 @@
                         </div>
                     </div>
                 </t-tooltip>
+                <t-tooltip v-if="assistantStore.entry === 'sidebar'" :content="assistantName" placement="right">
+                    <AssistantButton data-guide="assistant-entry" class="assistant-sidebar-entry" icon-only :icon-size="18"
+                        :label="assistantName" :active="assistantStore.visible" @click="assistantStore.toggle()" />
+                </t-tooltip>
             </div>
             <div class="menu_box" :class="{ 'menu_box--sticky': item.children && !uiStore.sidebarCollapsed }"
                 v-for="(item, index) in topMenuItems" :key="index">
@@ -85,9 +93,9 @@
                         @mouseleave="mouseleaveMenu(item.path)" :data-guide="`nav-${item.path}`"
                         :class="['menu_item', item.childrenPath && item.childrenPath == currentpath ? 'menu_item_c_active' : isMenuItemActive(item.path) ? 'menu_item_active' : '']">
                         <div class="menu_item-box">
-                            <div class="menu_icon">
+                            <div class="menu_icon" :class="`menu_icon--${item.icon}`">
                                 <img class="icon"
-                                    :src="getImgSrc(item.icon == 'zhishiku' ? knowledgeIcon : item.icon == 'agent' ? agentIcon : item.icon == 'artifact' ? artifactIcon : item.icon == 'toolbox' ? toolboxIcon : item.icon == 'organization' ? organizationIcon : item.icon == 'logout' ? logoutIcon : item.icon == 'setting' ? settingIcon : prefixIcon)"
+                                    :src="getImgSrc(item.icon == 'zhishiku' ? knowledgeIcon : item.icon == 'agent' ? agentIcon : item.icon == 'artifact' ? artifactIcon : item.icon == 'automation' ? automationIcon : item.icon == 'toolbox' ? toolboxIcon : item.icon == 'organization' ? organizationIcon : item.icon == 'logout' ? logoutIcon : item.icon == 'setting' ? settingIcon : prefixIcon)"
                                     alt="">
                             </div>
                             <template v-if="!uiStore.sidebarCollapsed">
@@ -163,6 +171,7 @@
                                     <div class="session-list-row__body">
                                         <SessionSidebarRow :item="subitem" :batch-mode="batchMode"
                                             :running="Boolean(sessionActivityEntries[subitem.id])"
+                                            :unread="Boolean(sessionUnread[subitem.id])"
                                             :active-path="currentSecondpath" :selected-ids="batchSelectedIds"
                                             :menu-options="buildSessionMenuOptions(subitem)"
                                             @navigate="gotopage(subitem.path)"
@@ -189,15 +198,15 @@
         <div v-if="batchMode && !uiStore.sidebarCollapsed" class="batch-inline-footer">
             <div class="batch-footer-left">
                 <t-checkbox :checked="isAllBatchSelected" :indeterminate="isBatchIndeterminate"
-                    @change="toggleBatchSelectAll">
+                    :disabled="batchDeleting" @change="toggleBatchSelectAll">
                     {{ t('batchManage.selectAll') }}
                 </t-checkbox>
             </div>
             <div class="batch-footer-right">
-                <t-button size="small" variant="text" @click="exitBatchMode">
+                <t-button size="small" variant="text" :disabled="batchDeleting" @click="exitBatchMode">
                     {{ t('batchManage.cancel') }}
                 </t-button>
-                <t-button size="small" theme="danger" variant="base" :disabled="batchSelectedIds.length === 0"
+                <t-button size="small" theme="danger" variant="base" :disabled="batchDeleting || batchSelectedIds.length === 0"
                     :loading="batchDeleting" @click="handleInlineBatchDelete">
                     {{ t('batchManage.delete') }}{{ batchSelectedIds.length > 0 ? `(${batchDisplayCount})` : '' }}
                 </t-button>
@@ -264,6 +273,7 @@ import {
 } from './sessionSidebarSourceFilter';
 import { logout as logoutApi } from '@/api/auth';
 import { useMenuStore } from '@/stores/menu';
+import { useSettingsStore } from '@/stores/settings';
 import { useSessionActivityStore } from '@/stores/sessionActivity';
 import { useAuthStore } from '@/stores/auth';
 import { useDeploymentCapabilitiesStore } from '@/stores/deploymentCapabilities';
@@ -273,6 +283,8 @@ import { useBrowserConnectionStore } from '@/stores/browserConnection';
 import { useOrganizationStore } from '@/stores/organization';
 import { useUIStore } from '@/stores/ui';
 import { useCommandPaletteStore } from '@/stores/commandPalette';
+import { useAssistantStore } from '@/stores/assistant';
+import AssistantButton from '@/components/assistant/AssistantButton.vue';
 import { MessagePlugin, DialogPlugin, Icon as TIcon } from "tdesign-vue-next";
 import UserMenu from '@/components/UserMenu.vue';
 import TenantSelector from '@/components/TenantSelector.vue';
@@ -310,7 +322,7 @@ const platformLogo = (p: string): string => (p ? PLATFORM_LOGO[p] || '' : '');
 const { t } = useI18n();
 const usemenuStore = useMenuStore();
 const sessionActivity = useSessionActivityStore();
-const { entries: sessionActivityEntries } = storeToRefs(sessionActivity);
+const { entries: sessionActivityEntries, unread: sessionUnread } = storeToRefs(sessionActivity);
 let sessionActivityTimer: ReturnType<typeof setInterval> | undefined;
 const authStore = useAuthStore();
 const deploymentCapabilities = useDeploymentCapabilitiesStore();
@@ -332,6 +344,8 @@ watch(() => uiStore.sidebarBrowserStatus && toolboxPreview.value.some((tool) => 
     if (visible && !browserConnection.loaded) browserConnection.refresh().catch(() => {});
 }, { immediate: true });
 const commandPaletteStore = useCommandPaletteStore();
+const assistantStore = useAssistantStore();
+const assistantName = computed(() => assistantStore.displayName || t('assistant.title'));
 
 // Platform-aware label for the ⌘K hint. navigator.platform is deprecated but
 // the alternatives (userAgentData.platform) aren't universally available yet;
@@ -450,6 +464,8 @@ const isMenuItemActive = (itemPath: string): boolean => {
             return currentRoute === 'toolbox';
         case 'artifacts':
             return currentRoute === 'artifactLibrary';
+        case 'automations':
+            return currentRoute === 'automationList';
         case 'organizations':
             return currentRoute === 'organizationList';
         case 'creatChat':
@@ -478,7 +494,7 @@ const getIconActiveState = (itemPath: string) => {
 };
 
 // 分离上下两部分菜单（使用 visibleMenuArr 以便 lite 模式过滤 logout）
-const TOP_MENU_PATHS = new Set(['creatChat', 'knowledge-bases', 'artifacts', 'agents', 'toolbox', 'organizations']);
+const TOP_MENU_PATHS = new Set(['creatChat', 'knowledge-bases', 'artifacts', 'agents', 'automations', 'toolbox', 'organizations']);
 
 const topMenuItems = computed<MenuItem[]>(() => {
     return (visibleMenuArr.value as unknown as MenuItem[]).filter((item: MenuItem) => TOP_MENU_PATHS.has(item.path));
@@ -592,16 +608,19 @@ const mouseleaveBotDown = () => {
 }
 
 const enterBatchMode = () => {
+    if (batchDeleting.value) return
     batchMode.value = true
     batchSelectedIds.value = []
 }
 
 const exitBatchMode = () => {
+    if (batchDeleting.value) return
     batchMode.value = false
     batchSelectedIds.value = []
 }
 
 const toggleBatchSelect = (id: string) => {
+    if (batchDeleting.value) return
     const idx = batchSelectedIds.value.indexOf(id)
     if (idx > -1) {
         batchSelectedIds.value.splice(idx, 1)
@@ -611,13 +630,16 @@ const toggleBatchSelect = (id: string) => {
 }
 
 const toggleBatchSelectAll = (checked: boolean) => {
+    if (batchDeleting.value) return
     batchSelectedIds.value = checked ? [...allSessionIds.value] : []
 }
 
 const handleInlineBatchDelete = () => {
-    if (batchSelectedIds.value.length === 0) return
-    const isDeleteAll = isAllBatchSelected.value
-    const displayCount = batchDisplayCount.value
+    if (batchDeleting.value || batchSelectedIds.value.length === 0) return;
+    const selectedIds = [...batchSelectedIds.value];
+    const isDeleteAll = isAllBatchSelected.value;
+    const displayCount = batchDisplayCount.value;
+    let submitted = false;
     const confirmDialog = DialogPlugin.confirm({
         header: t('batchManage.deleteConfirmTitle'),
         body: isDeleteAll
@@ -626,15 +648,25 @@ const handleInlineBatchDelete = () => {
         confirmBtn: { content: t('batchManage.delete'), theme: 'danger' as const },
         cancelBtn: t('batchManage.cancel'),
         theme: 'warning',
+        confirmOnEnter: false,
+        onClose: () => {
+            if (!batchDeleting.value) confirmDialog.destroy();
+        },
         onConfirm: async () => {
-            batchDeleting.value = true
+            if (submitted || batchDeleting.value) return;
+            submitted = true;
+            batchDeleting.value = true;
             try {
-                let res: any
-                if (isDeleteAll) {
-                    res = await deleteAllSessions()
-                } else {
-                    res = await batchDelSessions([...batchSelectedIds.value])
-                }
+                confirmDialog.update({
+                    confirmLoading: true,
+                    closeOnEscKeydown: false,
+                    closeOnOverlayClick: false,
+                    closeBtn: false,
+                    cancelBtn: { content: t('batchManage.cancel'), disabled: true },
+                });
+                const res = isDeleteAll
+                    ? await deleteAllSessions()
+                    : await batchDelSessions(selectedIds);
                 if (res && res.success === true) {
                     if (isDeleteAll) {
                         usemenuStore.clearMenuArr();
@@ -642,30 +674,28 @@ const handleInlineBatchDelete = () => {
                         await getMessageList();
                     } else {
                         let next = sessionBuckets.value;
-                        for (const id of batchSelectedIds.value) {
-                            next = removeSessionFromBuckets(next, id);
-                        }
+                        for (const id of selectedIds) next = removeSessionFromBuckets(next, id);
                         sessionBuckets.value = next;
                         syncMenuStoreFromBuckets();
                     }
                     const currentChatId = route.params.chatid as string;
-                    if (currentChatId && (isDeleteAll || batchSelectedIds.value.includes(currentChatId))) {
+                    if (currentChatId && (isDeleteAll || selectedIds.includes(currentChatId)))
                         router.push('/platform/creatChat');
-                    }
-                    batchSelectedIds.value = []
-                    MessagePlugin.success(t('batchManage.deleteSuccess'))
-                    exitBatchMode()
+                    batchSelectedIds.value = [];
+                    batchMode.value = false;
+                    MessagePlugin.success(t('batchManage.deleteSuccess'));
                 } else {
-                    MessagePlugin.error(t('batchManage.deleteFailed'))
+                    MessagePlugin.error(t('batchManage.deleteFailed'));
                 }
             } catch {
-                MessagePlugin.error(t('batchManage.deleteFailed'))
+                MessagePlugin.error(t('batchManage.deleteFailed'));
+            } finally {
+                batchDeleting.value = false;
+                confirmDialog.destroy();
             }
-            batchDeleting.value = false
-            confirmDialog.destroy()
         },
-    })
-}
+    });
+};
 
 const handleSessionMenuClick = (data: { value: string }, item: any) => {
     if (data?.value === 'delete') {
@@ -1033,7 +1063,7 @@ const loadSessionOriginMeta = async () => {
 const handleSessionMutation = (event: Event) => {
     const detail = (event as CustomEvent<SessionMutationDetail>).detail;
     if (!detail?.sessionId) return;
-    if (detail.removed || detail.messagesCleared) sessionActivity.update(detail.sessionId, false);
+    if (detail.removed || detail.messagesCleared) sessionActivity.dismiss(detail.sessionId);
     if (detail.patch) {
         updateSessionInBuckets(detail.sessionId, {
             ...detail.patch,
@@ -1050,6 +1080,8 @@ const handleSessionMutation = (event: Event) => {
 };
 
 onMounted(async () => {
+    sessionActivity.restore();
+    void sessionActivity.refresh();
     sessionActivityTimer = setInterval(() => { void sessionActivity.refresh(); }, 5000);
     const routeName = typeof route.name === 'string' ? route.name : (route.name ? String(route.name) : '')
     currentpath.value = routeName;
@@ -1121,6 +1153,7 @@ let settingIcon = ref('setting.svg');
 let agentIcon = ref('agent.svg');
 let artifactIcon = ref('artifact.svg');
 let toolboxIcon = ref('toolbox.svg');
+let automationIcon = ref('automation.svg');
 let organizationIcon = ref('organization.svg');
 let pathPrefix = ref(route.name)
 const getIcon = (path: string) => {
@@ -1142,6 +1175,7 @@ const getIcon = (path: string) => {
     artifactIcon.value = artifactsActiveState ? 'artifact-green.svg' : 'artifact.svg';
 
     toolboxIcon.value = route.name === 'toolbox' ? 'toolbox-green.svg' : 'toolbox.svg';
+    automationIcon.value = route.name === 'automationList' ? 'automation-green.svg' : 'automation.svg';
 
     // 组织图标：只在组织页面显示绿色
     organizationIcon.value = organizationsActiveState ? 'organization-green.svg' : 'organization.svg';
@@ -1210,6 +1244,8 @@ const gotopage = async (path: string) => {
         return;
     } else {
         if (path === 'creatChat') {
+            // 再次点击当前「新对话」时路由不会变化，仍需清空上一条草稿的引用。
+            if (isInCreatChat.value) useSettingsStore().clearChatReferences()
             // 如果在知识库详情页，跳转到全局对话创建页
             if (isInKnowledgeBase.value) {
                 router.push('/platform/creatChat')
@@ -1253,16 +1289,16 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
 <style lang="less" scoped>
 .aside_box {
     // 侧栏水平栅格：图标列与文案列统一对齐（Logo / 菜单 / 会话分组 / 会话行）
-    --sidebar-inset-x: 14px;
+    --sidebar-inset-x: 10px;
     --sidebar-icon-size: 18px;
     --sidebar-channel-icon: 14px;
     --sidebar-icon-gap: 8px;
-    --sidebar-text-inset: calc(var(--sidebar-inset-x) + var(--sidebar-icon-size) + var(--sidebar-icon-gap)); // 40px
+    --sidebar-text-inset: calc(var(--sidebar-inset-x) + var(--sidebar-icon-size) + var(--sidebar-icon-gap)); // 36px
 
     min-width: 0;
     width: var(--sidebar-width, 260px);
     flex-shrink: 0;
-    padding: 8px 6px 6px;
+    padding: 8px 4px 6px;
     background: var(--td-bg-color-sidebar);
     box-sizing: border-box;
     /* Avoid 100vh because <html> carries a `zoom` multiplier for font-size
@@ -1287,15 +1323,23 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         transition: none;
     }
 
-    &--collapsed {
-        min-width: 60px;
-        width: 60px;
-        padding: 8px 3px 6px;
+    &.aside_box--collapsed {
+        min-width: 48px;
+        width: 48px;
+        padding: 8px 0;
         overflow: visible;
+
+        .menu_box {
+            align-items: center;
+        }
 
         .menu_item {
             justify-content: center;
-            padding: 7px 0;
+            width: 32px;
+            height: 32px;
+            padding: 0;
+            margin: 0 auto 6px;
+            border-radius: var(--app-radius-sm);
 
             .menu_item-box {
                 justify-content: center;
@@ -1304,13 +1348,17 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
 
             .menu_icon {
                 margin-right: 0;
+                justify-content: center;
             }
+        }
+
+        .menu_item_active {
+            border-radius: var(--app-radius-sm);
         }
 
         .menu_bottom {
             align-items: center;
         }
-
         .menu_top {
             margin-right: 0;
             padding-right: 0;
@@ -1321,17 +1369,19 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        height: 50px;
+        // 保留侧栏顶部留白，让 Logo 和操作按钮与窗口顶边保持舒适间距
+        height: 39px;
+        margin: 0 0 4px;
         flex-shrink: 0;
-        padding: 0 10px 0 var(--sidebar-inset-x);
+        padding: 0 2px 0 var(--sidebar-inset-x);
     }
 
     .sidebar-toggle {
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 18px;
-        height: 18px;
+        width: 28px;
+        height: 28px;
         flex-shrink: 0;
         cursor: pointer;
         color: var(--td-text-color-secondary);
@@ -1353,7 +1403,7 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         overflow: hidden;
 
         .logo {
-            width: 128px;
+            width: 108px;
             height: auto;
         }
 
@@ -1462,7 +1512,7 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         align-items: center;
         justify-content: space-between;
         height: 34px;
-        padding: 6px 10px 6px var(--sidebar-inset-x);
+        padding: 6px 8px 6px var(--sidebar-inset-x);
         box-sizing: border-box;
         margin-bottom: 1px;
         border-radius: var(--app-radius-xs);
@@ -1486,8 +1536,11 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
 
     .menu_icon {
         display: flex;
+        align-items: center;
+        justify-content: center;
         flex: 0 0 var(--sidebar-icon-size);
         width: var(--sidebar-icon-size);
+        height: var(--sidebar-icon-size);
         margin-right: var(--sidebar-icon-gap);
         color: var(--td-text-color-secondary);
 
@@ -1495,6 +1548,14 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
             width: 18px;
             height: 18px;
             overflow: hidden;
+        }
+
+        // 图形几乎占满画布的图标缩小显示，否则会比其他图标大一圈
+        &.menu_icon--zhishiku .icon,
+        &.menu_icon--organization .icon,
+        .icon.icon--toggle {
+            width: 16px;
+            height: 16px;
         }
     }
 
@@ -1504,7 +1565,7 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         font-family: var(--app-font-family);
         font-size: var(--app-text-base);
         font-style: normal;
-        font-weight: 600;
+        font-weight: 500;
         line-height: 20px;
         overflow: hidden;
         white-space: nowrap;
@@ -1554,7 +1615,7 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         display: flex;
         align-items: center;
         gap: var(--sidebar-icon-gap);
-        padding: 0 10px 0 var(--sidebar-inset-x);
+        padding: 0 8px 0 var(--sidebar-inset-x);
         min-width: 0;
         box-sizing: border-box;
     }
@@ -1611,11 +1672,11 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
     .session-list-scope-header {
         position: absolute;
         top: 4px;
-        right: 10px;
+        right: 8px;
         z-index: 2;
         display: flex;
         justify-content: flex-end;
-        max-width: calc(100% - var(--sidebar-inset-x) - 10px);
+        max-width: calc(100% - var(--sidebar-inset-x) - 8px);
 
         :deep(.session-source-filter--inline) {
             flex: 0 1 auto;
@@ -1639,9 +1700,13 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         min-width: 0;
         overflow: hidden;
 
+        &.session-chat-row {
+            margin-bottom: 1px;
+        }
+
         &.session-chat-row .session-list-row {
-            min-height: 30px;
-            padding-right: 6px;
+            height: 34px;
+            padding-right: 4px;
             border-radius: var(--app-radius-sm);
             transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
         }
@@ -1687,7 +1752,7 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
         line-height: 20px;
         height: 100%;
         width: 100%;
-        padding: 6px 0;
+        padding: 0;
         position: relative;
         min-width: 0;
         background: transparent;
@@ -1698,11 +1763,6 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
             flex: 1 1 auto;
             min-width: 0;
             overflow: hidden;
-        }
-
-        .session-running-indicator {
-            flex: 0 0 16px;
-            flex-shrink: 0;
         }
 
         .submenu_title-text {
@@ -1787,16 +1847,23 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
 .logo_actions {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 2px;
     flex-shrink: 0;
+}
+
+.aside_box--collapsed .assistant-sidebar-entry {
+    display: flex;
+    width: 32px;
+    height: 32px;
+    margin: 0 auto 6px;
 }
 
 .header-icon-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
+    width: 28px;
+    height: 28px;
     flex-shrink: 0;
     cursor: pointer;
     border-radius: var(--app-radius-sm);
@@ -1806,6 +1873,11 @@ const resizeSidebar = (delta: number, keyboard: boolean) => {
 
     &:hover {
         background: var(--td-bg-color-container-hover);
+    }
+
+    &.is-active {
+        background: var(--td-bg-color-container-hover);
+        color: var(--td-brand-color);
     }
 
     .header-icon-img {
