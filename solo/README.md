@@ -4,7 +4,7 @@
 
 - 上游基线：`Tencent/WeKnora`（远端 `upstream`，只拉）；fork：`qiuchengw/WeKnora`（远端 `origin`，**单一车道分支 `main`**）
   - **2026-11-10 起单分支拓扑**：`main` = 上游 + 车道提交；fork 的 `solo` 分支已删除，纯上游基线只看 `upstream/main`。
-  - **当前基线 = 上游 `main` 合并点**（`cbdcebab`，2026-11-10）。
+  - **当前基线 = 上游 `main` 合并点**（`7d064bc3a`，2026-11-17）。
   - 发布物按**具体 commit SHA** 记录：上游基线 SHA + 本车道分支 SHA + 构建命令 + SHA256（`main` 是移动目标）。
 - 决策依据：`solo` 仓库 `docs/adr/0019-kb-engine-externalization.md`（D-13 构建来源纪律、D-15 车道模型、D-16 问数归属）。
 - 形态：**单进程无头服务**（`cmd/server`，`EDITION=lite`），由 Solo 宿主 spawn 一个子进程，走 `127.0.0.1 + token`。
@@ -144,6 +144,30 @@
 - **分支收敛（2026-11-10）**：`main` 即车道分支（上游 + 车道提交）；fork 的 `solo` 分支已删除，
   `origin/main` 不再镜像上游，纯上游对照/比价只看 `upstream/main`。合并提交 `73fdfab7`，本文件与测试签名修复随后同批提交。
 
+### 上游同步记录（2026-11-17，部署候选）
+
+- 同步到上游 `7d064bc3a`（**102 commit / 241 文件**，+11,326/−1,161，自 `cbdcebab`）；`VERSION` **仍 0.9.0**
+  （94 fix / 1 feat / 2 test，修复为主：preview/notion/feishu/dashscope rerank/automation/chunker/cmdk 等）。
+- **文本冲突 0 处**；合并提交 `dfd4c89f3`；合并树 vs pristine 上游仍恰好 **17 个车道文件（+981/−16）**，
+  问数端点 / DuckDB 有界扩展安装 / `content_revision` 投影 grep 存活。
+- **编译门禁 ✓**：`go build -tags sqlite_fts5 ./...` + 车道 `-run` 用例全绿（**233s**，暖缓存）；
+  `go test -tags sqlite_fts5 -run '^$' ./internal/...` 全测试包编译通过；`internal/router` 与问数 4 用例通过。
+- **上游改动面**：`SearchResult` 仅新增附加字段 `EvidenceHandles`（`json:"evidence_handles,omitempty"`）；
+  `KnowledgeRepository.FinalizeSubtask` 签名加 `attempt`（编译门禁覆盖）；rerank enrichment 改为按
+  `content_revision` 校验后再替换结果（对车道 `content_revision` 投影更严格）；问数工具修共享 KB 的存储租户解析。
+- **迁移**：sqlite **+1 条**（`000053_im_session_mode_indexes`，只重建 IM 唯一索引，无数据删除）；
+  既有迁移无改动/删除；包内 up 迁移共 **54** 条。
+- **升级迁移演练（Win + Docker 双路径 PASS）**：旧 0.9.0 空目录 ⇒ `(52,0)`/90 表；新 0.9.0 **同一数据目录**
+  ⇒ `(53,0)`/90 表、日志 `Database migrated from version 52 to 53`、`/health` 200、无 migration failed。
+  容器路径 `system/info` 自报 `version=0.9.0 / commit=dfd4c89f3 / db_version=53`。
+- **容器 canary**：桩 embedding/rerank（OpenAI 兼容）：manual 文档 → `completed/enabled`；`hybrid-search` 1 命中且
+  `content_revision=0`；`rerank:{enabled:true}` ⇒ `meta.rerank={applied:true,outcome:ok}`。
+- **部署候选产物（本地，未上传）**：`kb-engine-0.9.0-win32-x64.zip`（84.2 MB / 88,253,590 B，
+  `sha512 e84cf1b0…e1d`）+ `kb-engine-0.9.0-linux-x64.tar.gz`（87.7 MB / 91,938,869 B，`sha512 209d7d0a…05e`）；
+  linux 二进制 `0755`，两包均含 `config/` + `migrations/`（54 up）+ `jieba-dict/`。
+- **版本口径**：沿用上游 `0.9.0`（上一轮 0.9.0 尚未上传）；若平台侧已登记过 0.9.0，按「patch 偶数 = stable」
+  改为 `0.9.2` 重打即可（仅 `--engine-version` 变化）。
+
 ## 跟车成本台账（P1 触发器数据源；2026-09-22 启用）
 
 > 与「产物事实」的分工：上方已拍板**产物事实只在发布侧记一处**（每构建就变的数字）；本台账记的是
@@ -162,6 +186,7 @@
 | 2026-09-26 | `aaec920a` → `9fcc2c67`（186 commit / 1733 文件） | **≈483**（5 处：service 95 + 其测试 362 + container 4 + handler 10 + types 12；**其中 457 行是"上游已收编 ⇒ 整文件取上游"**，真需人工判断的仅 ~26 行） | ~1.5 | ✓ `go build ./...` + 车道用例全绿（129s）；产物冒烟 253M | 见上方同步记录；**车道净减 2 项**（E1/`enable_rerank` 被上游收编） |
 | 2026-10-11 | `9fcc2c67` → `150d8cc60`（175 commit） | 0（全自动） | ~0.5 | ✓ `go build ./...` + 车道用例全绿（Solo 侧 311s；构建侧 win 236s / linux 547s） | 见上方同步记录；0.8.7 产物双平台 + 升级演练 PASS（33→34） |
 | 2026-11-10 | `150d8cc60` → `cbdcebab`（568 commit / 2775 文件） | 1 处（`router.go` 6 行；另有 1 处测试签名编译错 `operations_test.go`） | ~1 | ✓ `go build ./...` + 车道用例（462s）；`go test -run '^$' ./internal/...` 全测试包编译 ✓；router / 问数端点用例 ✓ | **已合入 `main`**（单分支拓扑）；上游 0.9.0；sqlite +18 迁移；升级演练 34→52 PASS |
+| 2026-11-17 | `cbdcebab` → `7d064bc3a`（102 commit / 241 文件） | 0（全自动） | ~0.7 | ✓ `go build ./...` + 车道用例（233s）；全测试包编译 ✓；router / 问数用例 ✓；Win + Docker 升级演练 52→53 PASS；容器 canary ✓ | 上游仍 0.9.0（94 fix）；sqlite +1（`000053`）；双平台 0.9.0 部署候选（未上传） |
 
 ## 为什么需要本车道（但源码改动很少）
 
